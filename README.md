@@ -55,13 +55,14 @@ tee-claude -p "explain this repo"   # extra arguments pass through to claude
 
 ---
 
-## Three limits to know before you rely on this
+## Four limits to know before you rely on this
 
 | | |
 |---|---|
 | **It is off every night.** | Powered down nightly, ~20 min to reload after power-on. Its IP *and* port change on each restart. If a check fails, the machine being off is the likeliest reason. → [detail](#the-nightly-outage) |
 | **It cannot see images or PDFs**, and left alone it invents answers about them. | The launcher blocks what it can, but **cannot** block an image you paste into the prompt box. → [detail](#images-and-pdfs) |
 | **Privacy here is configuration, not proof.** | Prompts aren't logged, but that is how the endpoint is configured — not something cryptography enforces. → [detail](#what-privacy-does-and-does-not-mean) |
+| **`/cost` overstates your spend by about 36×.** | Claude Code prices this model as if it were Anthropic's most expensive tier. The endpoint's own figure is the one you are billed on. → [detail](#cost-is-not-what-you-are-billed) |
 
 ---
 
@@ -160,6 +161,59 @@ retains the technical ability to reach data in memory.
 
 Every check that *would* prove otherwise (`[14]`–`[34]`) reports `UNSUPPORTED`, because the
 hardware to establish it is not there. **Do not send data you cannot afford to expose.**
+
+---
+
+## `/cost` is not what you are billed
+
+Claude Code works the number out on your machine. It takes the token counts the endpoint
+returns and multiplies them by prices from a table compiled into Claude Code — and that table
+only covers Anthropic's own models. This endpoint does not serve one, so there is no entry for
+it and Claude Code falls back to a default of **$5.00 per million input tokens and $25.00 per
+million output**, which are Anthropic Opus-tier rates.
+
+The rates configured on this endpoint are **$0.14 per million input tokens and $0.28 per
+million output** — about 36× cheaper. So every figure `/cost` and the end-of-session summary
+show is inflated by roughly that factor. A measured session:
+
+| | input tokens | output tokens | `/cost` said | actually cost |
+|---|---|---|---|---|
+| one session | 125,128 | 793 | **$0.64547** | **$0.01774** |
+| four sessions | | | **$6.20** | **$0.386** |
+
+Claude Code knows it is guessing: when this happens it appends *"(costs may be inaccurate due
+to usage of unknown models)"* to the total in the end-of-session summary. That warning is the
+only signal you get, and `/cost` itself does not carry it.
+
+**Nothing you can set fixes this.** There is no setting, environment variable or policy key
+that supplies a price for a model Claude Code does not ship a price for — it takes per-model
+rates only from a table compiled into the binary, or from account configuration delivered by
+Anthropic's own API, and neither can describe this model. The cost this endpoint returns in
+the response headers (below) is not something Claude Code reads. Read `/cost` as a token
+counter with the wrong multiplier, and divide by ~36 if you want a rough figure.
+
+**The billing figure comes from the endpoint.** Every completion response carries it in the
+headers:
+
+| header | what it is |
+|---|---|
+| `x-litellm-response-cost-original` | USD cost of that single request |
+| `x-litellm-key-spend` | your running total on this credential, in USD |
+| `x-litellm-key-max-budget` | the ceiling that is actually enforced |
+
+Those three ride on `/v1/messages` and `/v1/chat/completions` responses only. `/v1/models` and
+`/v1/messages/count_tokens` do not carry them, and the `/spend` and key-management routes are
+not published, so there is no way to read your balance without making a real request — ask the
+operator if you need a readout.
+
+### Do not rely on `--max-budget-usd`
+
+Claude Code checks that flag against its own inflated figure, so it will stop a session at
+roughly **1/36th** of the budget you asked for.
+
+The ceiling that actually holds is `max_budget` on your credential. The endpoint enforces it
+with the correct rates, independently of anything on your machine, and it is unaffected by this
+bug. Ask the operator to change it if you need a different limit.
 
 ---
 
