@@ -1,0 +1,171 @@
+name: release
+
+# Tag, build, checksum, publish. Nothing here needs a secret we do not have:
+# GITHUB_TOKEN is provided by Actions itself. The signing step is present but
+# self-disabling — see the comment on it.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and release (e.g. v0.2.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      # Empty when the secret is not configured, which is the state today.
+      SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY_ED25519 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve tag
+        id: v
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="${GITHUB_REF#refs/tags/}"; fi
+          case "$TAG" in
+            v*) ;;
+            *) echo "tag must start with v (got '$TAG')"; exit 1 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "name=mynacloud-client-$TAG" >> "$GITHUB_OUTPUT"
+
+      # ---- gate 1: it has to parse ---------------------------------------
+      - name: Syntax
+        run: |
+          bash -n tee-claude
+          bash -n install.sh
+          python3 -m py_compile websearch-mcp.py no-attachment-hook.py
+          python3 -c "import json,sys; json.load(open('policy.example.json'))"
+
+      - name: Compile the shell script's embedded Python
+        run: |
+          python3 - <<'EOF'
+          import re, sys
+          src = open("tee-claude", encoding="utf-8").read()
+          progs = [m.group(1) for m in
+                   re.finditer(r"<<'PY'(?:\s*\|\|\s*true)?\n(.*?)\nPY\n", src, re.S)]
+          progs += [m.group(1) for m in re.finditer(r"python3 -c '([^']*)'", src)]
+          assert progs, "no embedded programs found — did the layout change?"
+          bad = 0
+          for i, p in enumerate(progs):
+              try:
+                  compile(p, "<embedded-%d>" % i, "exec")
+              except SyntaxError as e:
+                  bad += 1
+                  print("::error::embedded program %d: %s" % (i, e))
+          print("checked %d embedded programs" % len(progs))
+          sys.exit(1 if bad else 0)
+          EOF
+
+      # ---- gate 2: the version in the script has to match the tag ---------
+      - name: Version matches tag
+        run: |
+          IN_FILE="$(grep -m1 '^VERSION=' tee-claude | cut -d'"' -f2)"
+          if [ "v$IN_FILE" != "${{ steps.v.outputs.tag }}" ]; then
+            echo "::error::tee-claude VERSION is '$IN_FILE' but the tag is '${{ steps.v.outputs.tag }}'"
+            exit 1
+          fi
+
+      # ---- gate 3: nothing that looks like a credential goes out ----------
+      # This directory is public and has, historically, sat next to real keys.
+      # A grep is not a proof, but it catches the accident that actually happens.
+      - name: Secret scan
+        run: |
+          set +e
+          PATTERNS='sk-[A-Za-z0-9_-]{16,}|BEGIN [A-Z ]*PRIVATE KEY|Authorization: *Bearer +[A-Za-z0-9]|(MASTER|SALT|SECRET|API|ACCESS)_KEY *= *[A-Za-z0-9]|PASSWORD *= *[A-Za-z0-9]'
+          HITS=$(grep -rInE "$PATTERNS" . --exclude-dir=.git --exclude-dir=.github | grep -v 'YOUR-KEY-HERE')
+          if [ -n "$HITS" ]; then
+            echo "::error::possible credential in the release tree:"
+            echo "$HITS"
+            exit 1
+          fi
+          for f in policy.json policy.local.json .env token search.env; do
+            if [ -e "$f" ]; then echo "::error::$f must never be published"; exit 1; fi
+          done
+          echo "secret scan clean"
+
+      # ---- build ----------------------------------------------------------
+      - name: Build tarball
+        run: |
+          NAME="${{ steps.v.outputs.name }}"
+          mkdir -p "dist/$NAME"
+          cp tee-claude websearch-mcp.py no-attachment-hook.py \
+             policy.example.json install.sh README.md LICENSE "dist/$NAME/"
+          chmod 755 "dist/$NAME/tee-claude" "dist/$NAME/websearch-mcp.py" \
+                    "dist/$NAME/no-attachment-hook.py" "dist/$NAME/install.sh"
+          # Reproducible-ish: fixed mtime/owner/order, no gzip timestamp.
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="@${SOURCE_DATE_EPOCH:-0}" \
+              -cf "dist/$NAME.tar" -C dist "$NAME"
+          gzip -n -9 "dist/$NAME.tar"
+        env:
+          SOURCE_DATE_EPOCH: 0
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum "${{ steps.v.outputs.name }}.tar.gz" > SHA256SUMS
+          cat SHA256SUMS
+
+      # ---- sign (inert until a key exists) --------------------------------
+      # Skipped entirely when the secret is absent, which is the state today, so
+      # the workflow is green without it. When RELEASE_SIGNING_KEY_ED25519 is set
+      # to an Ed25519 private key in PEM form
+      #     openssl genpkey -algorithm ed25519 -out release.key
+      #     openssl pkey -in release.key -pubout        # pin THIS in tee-claude
+      # this produces SHA256SUMS.sig, which `tee-claude --update` verifies before
+      # it will replace anything.
+      - name: Sign SHA256SUMS
+        if: ${{ env.SIGNING_KEY != '' }}
+        working-directory: dist
+        run: |
+          umask 077
+          printf '%s' "$SIGNING_KEY" > k.pem
+          openssl pkeyutl -sign -inkey k.pem -rawin -in SHA256SUMS -out SHA256SUMS.sig
+          shred -u k.pem
+          echo "signed"
+
+      # ---- publish ---------------------------------------------------------
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.v.outputs.tag }}"
+          ASSETS="dist/${{ steps.v.outputs.name }}.tar.gz dist/SHA256SUMS"
+          if [ -f dist/SHA256SUMS.sig ]; then ASSETS="$ASSETS dist/SHA256SUMS.sig"; fi
+          {
+            echo "## Installing"
+            echo
+            echo '```sh'
+            echo "curl -fsSLO https://github.com/${{ github.repository }}/releases/download/$TAG/${{ steps.v.outputs.name }}.tar.gz"
+            echo "curl -fsSLO https://github.com/${{ github.repository }}/releases/download/$TAG/SHA256SUMS"
+            echo "sha256sum -c SHA256SUMS"
+            echo "tar -xzf ${{ steps.v.outputs.name }}.tar.gz && ./${{ steps.v.outputs.name }}/install.sh"
+            echo '```'
+            echo
+            if [ -f dist/SHA256SUMS.sig ]; then
+              echo "SHA256SUMS is signed; \`tee-claude --update\` verifies the signature."
+            else
+              echo "**This release is not signed.** \`tee-claude --update\` will verify the"
+              echo "SHA-256 and then stop rather than replace itself. Install deliberately."
+            fi
+            echo
+            echo "Remember to pin \`tls_spki_sha256\` in your policy — the launcher refuses to"
+            echo "start without it."
+          } > notes.md
+          gh release create "$TAG" $ASSETS \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --notes-file notes.md \
+            --verify-tag

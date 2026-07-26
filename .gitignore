@@ -1,0 +1,26 @@
+# Your own trust policy and any local state. NEVER committed: a committed
+# policy.json would give a fresh clone a working-looking endpoint, and the whole
+# point of the policy is that you install and approve it yourself.
+policy.json
+policy.local.json
+*.local.json
+*.bak
+
+# Credentials of every shape
+token
+.env
+.env.*
+search.env
+*.pem
+*.key
+*.crt
+
+# Build output
+dist/
+
+# Python / tooling noise
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log

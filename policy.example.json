@@ -1,0 +1,75 @@
+{
+  "_comment": [
+    "LOCAL TRUST POLICY for tee-claude. YOU install and approve this file.",
+    "Copy it to ~/.tee-claude/policy.json and edit it.",
+    "",
+    "It is never fetched from the endpoint being verified. The endpoint may",
+    "PROPOSE a change to the served model, and tee-claude will show you a diff",
+    "and ask you to type yes before recording it here (keeping a .bak). It can",
+    "never change endpoint_host, the TLS pins or the issuer expectation: those",
+    "are what make 'this is the right endpoint' mean anything, and they only",
+    "ever change because you changed them."
+  ],
+  "protocol_version": 2,
+
+  "_comment_endpoint": [
+    "The HOSTNAME is pinned here and is never discovered. Only the TCP PORT is",
+    "looked up at launch, from the DNS TXT record below, because the machine's",
+    "public IP and port both change every time it restarts (which is nightly).",
+    "",
+    "Consequence worth understanding: anyone who tampers with that TXT record",
+    "can move you to a different PORT on a host that still has to pass every",
+    "certificate check below. They cannot move you to a different host."
+  ],
+  "endpoint_scheme": "https",
+  "endpoint_host": "api.mynacloud.com",
+  "port_discovery": {
+    "method": "dns-txt",
+    "record": "_endpoint.api.mynacloud.com",
+    "key": "port"
+  },
+
+  "_comment_model": [
+    "The model you have approved, and the limits the launcher configures Claude",
+    "Code with. 491520 input / 32768 output is the real split on this deployment:",
+    "the model's 524288-token window minus the 32768-token output reservation."
+  ],
+  "model": "deepseek-v4-flash-abliterated",
+  "context_window": 491520,
+  "max_output_tokens": 32768,
+
+  "_comment_tls": [
+    "tls_spki_sha256 pins the endpoint's public key. Leaving it empty (or as",
+    "REPLACE-ME) makes check [10] FAIL and tee-claude refuse to launch — that is",
+    "deliberate. An unpinned key means the only thing between you and any",
+    "CA-issued certificate for this name is the public CA system, and a launcher",
+    "whose product is verification should not treat that as fine.",
+    "",
+    "Get the value from the operator's published release notes. `tee-claude",
+    "--print-spki` prints what the endpoint is currently presenting, so you can",
+    "compare the two; pinning whatever you happen to see, without comparing, is",
+    "trust-on-first-use and is much weaker.",
+    "",
+    "expected_issuer_* asserts the certificate is OURS and not merely valid.",
+    "This host's DNS is on Cloudflare in DNS-only mode. If that record is ever",
+    "switched to proxied, Cloudflare terminates TLS and presents its own",
+    "certificate: the chain would still verify and the hostname would still",
+    "match, while a third party read every prompt in plaintext. Check [11] is",
+    "what makes that loud instead of invisible.",
+    "",
+    "Tighten expected_issuer_cn_regex to the exact intermediate (for example",
+    "^YE2$) once you know which one issued the certificate; the pattern below",
+    "is the general shape of a Let's Encrypt intermediate CN."
+  ],
+  "min_tls_version": "TLSv1.2",
+  "tls_spki_sha256": "REPLACE-ME",
+  "expected_issuer_org": "Let's Encrypt",
+  "expected_issuer_cn_regex": "^[A-Z]{1,3}[0-9]{1,3}$",
+
+  "_future_tee_pins": [
+    "Once the endpoint runs in a Confidential VM these become enforceable and",
+    "checks [14]-[34] stop reporting UNSUPPORTED. They are intentionally absent",
+    "now rather than present-and-ignored, so the policy never implies a",
+    "guarantee the verifier cannot actually establish."
+  ]
+}

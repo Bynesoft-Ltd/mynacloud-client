@@ -1,0 +1,1177 @@
+#!/usr/bin/env bash
+# =============================================================================
+# tee-claude — verifying launcher for Claude Code against the mynacloud endpoint
+#
+# Runs the endpoint verification sequence, prints every check individually with
+# an honest verdict, shows the alpha-period disclosure, requires explicit typed
+# consent, then execs `claude` with the bridge environment applied.
+#
+# VERDICTS (UNSUPPORTED is NOT equivalent to VERIFIED):
+#   VERIFIED       proven by cryptographic evidence or direct measurement here
+#   FAILED         actively wrong -> launch is REFUSED, always, no override
+#   UNSUPPORTED    cannot be proven on this host (no TEE) -> disclosed + consented
+#   INFORMATIONAL  context only, not a security claim
+#
+# Design rules:
+#   - No check is ever silently skipped, and NO flag or environment variable
+#     turns FAILED into a pass. There is no non-interactive consent bypass.
+#   - Nothing that carries your credential runs before you have consented.
+#     Checks [37]+ are the post-consent block, and a FAILED there still
+#     refuses to launch.
+#   - No value that reaches a shell, a Python program or a JSON file is ever
+#     produced by string interpolation. Everything crosses process boundaries
+#     as argv, environment, or JSON encoded by a JSON encoder.
+#   - Every string that came from the network is stripped of control
+#     characters before it is printed, so a hostile endpoint cannot repaint
+#     this terminal.
+# =============================================================================
+set -uo pipefail
+
+VERSION="0.2.0-alpha"
+UPDATE_REPO="Bynesoft-Ltd/mynacloud-client"
+
+# Ed25519 public key (PEM, single line, base64 body) used by `--update` to verify
+# the release SHA256SUMS. EMPTY IN THIS BUILD: release signing is not yet
+# established, and `--update` therefore REFUSES to replace this file. It will
+# still check for a newer release, verify its SHA-256 and print what changed —
+# it just will not write. See docs in README.md ("Updating").
+UPDATE_PUBKEY_PEM=""
+
+# ---- locate ourselves, through symlinks (the installer symlinks into ~/.local/bin)
+_self="${BASH_SOURCE[0]}"
+while [[ -L "$_self" ]]; do
+    _dir="$(cd -P "$(dirname "$_self")" >/dev/null 2>&1 && pwd)"
+    _self="$(readlink "$_self")"
+    [[ "$_self" != /* ]] && _self="$_dir/$_self"
+done
+SELF="$(cd -P "$(dirname "$_self")" >/dev/null 2>&1 && pwd)/$(basename "$_self")"
+CLIENT_DIR="$(dirname "$SELF")"
+
+CONFIG_DIR="${TEE_CLAUDE_CONFIG_DIR:-$HOME/.tee-claude}"
+
+# Policy search order: explicit override, then the per-user config dir (where the
+# installer puts it), then next to the launcher (git checkout / tarball layout).
+if [[ -n "${TEE_CLAUDE_POLICY:-}" ]]; then
+    POLICY="$TEE_CLAUDE_POLICY"
+elif [[ -f "$CONFIG_DIR/policy.json" ]]; then
+    POLICY="$CONFIG_DIR/policy.json"
+else
+    POLICY="$CLIENT_DIR/policy.json"
+fi
+
+VERIFY_ONLY=0
+case "${1:-}" in
+    --verify-only) VERIFY_ONLY=1; shift ;;
+    --version)     echo "tee-claude $VERSION"; exit 0 ;;
+    -h|--help)
+        cat <<'USAGE'
+tee-claude — verifying launcher for Claude Code against the mynacloud endpoint
+
+  tee-claude [claude args...]   verify, disclose, ask for consent, launch Claude Code
+  tee-claude --verify-only      run the pre-consent checks and stop
+  tee-claude --print-spki       print the endpoint's current TLS SPKI pin and stop
+  tee-claude --update           check for a newer signed release
+  tee-claude --version
+  tee-claude --help
+
+Environment:
+  TEE_CLAUDE_POLICY       path to the local trust policy (default ~/.tee-claude/policy.json)
+  TEE_CLAUDE_CONFIG_DIR   per-user state directory (default ~/.tee-claude)
+  TEE_CLAUDE_SEARCH=off   disable the client-side web-search MCP server
+  TEE_CLAUDE_STRICT_MCP=1 load ONLY our MCP server, not the ones you have configured
+  TEE_CLAUDE_PORT=NNNN    skip DNS port discovery and use this port (the hostname
+                          stays pinned by your policy either way)
+  ANTHROPIC_AUTH_TOKEN    your session credential (or put it in ~/.tee-claude/token)
+
+There is deliberately no flag that converts a FAILED check into a pass.
+USAGE
+        exit 0 ;;
+esac
+
+# ---- verdict tallies -------------------------------------------------------
+n_ver=0; n_fail=0; n_unsup=0; n_info=0
+FAILED_DETAIL=()
+
+# Every printed field goes through san(): a hostile endpoint (or a hostile
+# filename) must not be able to emit ESC, CR or a newline into this listing and
+# repaint an UNSUPPORTED line as VERIFIED. [audit A27]
+# C0 and DEL are stripped here, portably. C1, bidi overrides and the unicode line
+# separators are stripped by CTRL_RE inside every Python program that ingests a
+# server-supplied string, i.e. at the point where such a string enters at all.
+san() { printf '%s' "${1-}" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-300; }
+
+c()  { printf '  [%02d] %-13s %s\n' "$1" "$2" "$(san "$3")"; }
+ver()   { c "$1" VERIFIED      "$2"; n_ver=$((n_ver+1)); }
+fail()  { c "$1" FAILED        "$2"; n_fail=$((n_fail+1)); FAILED_DETAIL+=("[$1] $(san "$2")"); }
+unsup() { c "$1" UNSUPPORTED   "$2"; n_unsup=$((n_unsup+1)); }
+info()  { c "$1" INFORMATIONAL "$2"; n_info=$((n_info+1)); }
+
+die() { echo "  FATAL: $(san "$1")" >&2; exit "${2:-2}"; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not on PATH"; }
+
+# ---- helper programs -------------------------------------------------------
+# Held in variables and handed to `python3 -c` because these ones read their
+# INPUT on stdin, so stdin is not available to carry the program. They are
+# single-quoted heredocs: no shell expansion happens inside them, ever. Data
+# always arrives as argv or on stdin — never spliced into the program text.
+# [audit A25 — the class of bug, not just the one instance of it]
+read -r -d '' PY_TXT_PORT <<'PY' || true
+import re, sys
+key = sys.argv[1]
+raw = sys.stdin.read()
+# One TXT resource record per line. Within a line a record may be split into
+# adjacent quoted 255-byte character-strings, which DNS defines as concatenated,
+# so join those; but keep separate RRs separate, because two RRs naming two
+# different ports is an ambiguity, not a longer string.
+found = set()
+for line in raw.splitlines():
+    parts = re.findall(r'"([^"]*)"', line)
+    record = "".join(parts) if parts else line.strip()
+    if not record:
+        continue
+    for m in re.finditer(r'(?:^|[;,\s])%s\s*=\s*(\d{1,5})(?=$|[;,\s])' % re.escape(key), record):
+        n = int(m.group(1))
+        if 1 <= n <= 65535:
+            found.add(n)
+# Exactly one answer, or nothing. Two different ports is ambiguous, and guessing
+# which one the operator meant is precisely the kind of fail-open this launcher
+# exists to avoid.
+print(found.pop() if len(found) == 1 else "")
+PY
+
+read -r -d '' PY_CERT_ID <<'PY' || true
+import os, re, sys
+host = sys.argv[1].lower()
+txt = sys.stdin.read()
+
+def field(prefix, key):
+    for line in txt.splitlines():
+        if line.startswith(prefix):
+            m = re.search(r'(?:^|,)\s*%s=((?:[^,\\]|\\.)*)' % key, line[len(prefix):])
+            if m:
+                return m.group(1).replace("\\", "")
+    return ""
+
+issuer_o = field("issuer=", "O")
+issuer_cn = field("issuer=", "CN")
+names = set(n.lower().rstrip(".") for n in re.findall(r'DNS:([^,\s]+)', txt))
+cn = field("subject=", "CN")
+if cn:
+    names.add(cn.lower().rstrip("."))
+
+def matches(n):
+    if n == host:
+        return True
+    if n.startswith("*."):                    # exactly one label, per RFC 6125
+        return host.endswith(n[1:]) and host.count(".") == n.count(".")
+    return False
+
+want_o = os.environ.get("ISSUER_ORG", "")
+want_cn = os.environ.get("ISSUER_CN_RE", "")
+problems = []
+if want_o and issuer_o != want_o:
+    problems.append("issuer O=%r, expected %r" % (issuer_o, want_o))
+if want_cn:
+    try:
+        ok = bool(re.search(want_cn, issuer_cn or ""))
+    except re.error:
+        ok = False
+        problems.append("policy expected_issuer_cn_regex is not a valid regex")
+    if not ok:
+        problems.append("issuer CN=%r does not match %r" % (issuer_cn, want_cn))
+if not any(matches(n) for n in names):
+    problems.append("leaf identifies %s, not %s" % (sorted(names) or ["nothing"], host))
+ctrl = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+if problems:
+    print("FAIL " + ctrl.sub("", "; ".join(problems))[:240])
+else:
+    print("OK " + ctrl.sub("", "issuer %s / %s, leaf matches %s" % (issuer_o, issuer_cn, host))[:240])
+PY
+
+read -r -d '' PY_MODEL_INFO <<'PY' || true
+import json, re, sys
+# Every string below is attacker-controlled if the endpoint is hostile or has
+# been compromised, and all of them are printed to a terminal and exported into
+# a child process's environment. C0/C1 controls, DEL, bidi overrides and the
+# unicode line separators are removed where they enter. [audit A27]
+CTRL_RE = re.compile(
+    "[\x00-\x1f\x7f-\x9f"          # C0, DEL, C1 (ESC and CR live here)
+    "\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069"
+    "\u2028\u2029\ufeff]"           # soft hyphen, bidi overrides, separators
+)
+def clean(x, cap=160):
+    return CTRL_RE.sub("", str(x if x is not None else ""))[:cap]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+rows = d.get("data") or d.get("model_list") or []
+for r in rows:
+    if not isinstance(r, dict):
+        continue
+    name = clean(r.get("model_name") or "", 100)
+    if not name or name == "*":
+        continue
+    mi = r.get("model_info") if isinstance(r.get("model_info"), dict) else {}
+    def num(v):
+        try:
+            n = int(v)
+        except Exception:
+            return ""
+        return str(n) if 0 < n <= 100000000 else ""
+    print("\t".join([name,
+                     clean(mi.get("display_name") or name, 120),
+                     clean(mi.get("description") or "", 300),
+                     num(mi.get("max_input_tokens")),
+                     num(mi.get("max_tokens"))]))
+    break
+PY
+
+read -r -d '' PY_MODEL_LIST <<'PY' || true
+import json, re, sys
+CTRL_RE = re.compile(
+    "[\x00-\x1f\x7f-\x9f"          # C0, DEL, C1 (ESC and CR live here)
+    "\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069"
+    "\u2028\u2029\ufeff]"           # soft hyphen, bidi overrides, separators
+)
+def clean(x, cap=160):
+    return CTRL_RE.sub("", str(x if x is not None else ""))[:cap]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print(""); sys.exit(0)
+ids = [clean(m.get("id"), 100) for m in (d.get("data") or [])
+       if isinstance(m, dict) and m.get("id") and m.get("id") != "*"]
+print(",".join(i for i in ids if i)[:300])
+PY
+
+# =============================================================================
+# --update — see the long comment above UPDATE_PUBKEY_PEM
+# =============================================================================
+if [[ "${1:-}" == "--update" ]]; then
+    need curl; need python3; need tar
+    if command -v sha256sum >/dev/null 2>&1; then SHA256="sha256sum"
+    elif command -v shasum  >/dev/null 2>&1; then SHA256="shasum -a 256"
+    else die "no sha256sum/shasum available; cannot verify a download"; fi
+
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/tee-claude-update.XXXXXX")" || die "mktemp failed"
+    chmod 700 "$tmp"; trap 'rm -rf "$tmp"' EXIT
+
+    echo "Checking https://github.com/$UPDATE_REPO for a newer release..."
+    if ! curl -fsS --proto '=https' --tlsv1.2 -m 30 \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$UPDATE_REPO/releases/latest" -o "$tmp/rel.json"; then
+        die "could not reach the release API (the release feed is on GitHub, not on the inference endpoint)"
+    fi
+
+    # Parse with a JSON parser, never with a regex over the response. Every field
+    # is constrained to a safe shape here: a tag or an asset URL from the network
+    # goes on to be printed and used to build paths.
+    python3 - "$tmp/rel.json" > "$tmp/parsed" <<'PY' || die "could not parse the release metadata"
+import json, re, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+tag = (d.get("tag_name") or "").strip()
+if not re.fullmatch(r"v?[0-9A-Za-z.+_-]{1,64}", tag or ""):
+    tag = ""
+assets = {a.get("name"): a.get("browser_download_url")
+          for a in (d.get("assets") or []) if isinstance(a, dict)}
+def url(name_pred):
+    for n, u in assets.items():
+        if not isinstance(n, str) or not isinstance(u, str):
+            continue
+        if name_pred(n) and u.startswith("https://") and " " not in u:
+            return u
+    return ""
+print(tag or "-")
+print(url(lambda n: n.endswith(".tar.gz")) or "-")
+print(url(lambda n: n == "SHA256SUMS") or "-")
+print(url(lambda n: n == "SHA256SUMS.sig") or "-")
+PY
+    { read -r TAG; read -r ASSET_URL; read -r SUMS_URL; read -r SIG_URL; } < "$tmp/parsed"
+
+    [[ "$TAG" == "-" ]] && die "the release feed contains no tagged release"
+    if [[ "v$VERSION" == "$TAG" || "$VERSION" == "$TAG" ]]; then
+        echo "Already on the latest release ($TAG). Nothing to do."; exit 0
+    fi
+    echo "Installed: $VERSION"
+    echo "Latest:    $TAG"
+    echo
+    echo "--- what changed -------------------------------------------------"
+    python3 - "$tmp/rel.json" <<'PY'
+import json, re, sys
+d = json.load(open(sys.argv[1]))
+body = d.get("body") or "(the release carries no notes)"
+# Release notes are third-party text rendered into a terminal: strip controls.
+body = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", body)
+print("\n".join(body.splitlines()[:80]))
+PY
+    echo "------------------------------------------------------------------"
+    echo
+
+    [[ "$ASSET_URL" == "-" || "$SUMS_URL" == "-" ]] && \
+        die "release $TAG has no tarball and/or no SHA256SUMS asset — refusing to install it"
+
+    curl -fsSL --proto '=https' --tlsv1.2 -m 120 "$ASSET_URL" -o "$tmp/pkg.tar.gz" || die "download failed"
+    curl -fsSL --proto '=https' --tlsv1.2 -m 30  "$SUMS_URL"  -o "$tmp/SHA256SUMS" || die "SHA256SUMS download failed"
+
+    want="$(python3 - "$tmp/SHA256SUMS" "$(basename "${ASSET_URL##*/}")" <<'PY'
+import sys
+name = sys.argv[2]
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    parts = line.split()
+    if len(parts) >= 2 and parts[-1].lstrip("*") == name:
+        print(parts[0].lower()); break
+else:
+    print("")
+PY
+)"
+    [[ -n "$want" ]] || die "SHA256SUMS does not list $(basename "${ASSET_URL##*/}") — refusing"
+    got="$($SHA256 "$tmp/pkg.tar.gz" | awk '{print $1}')"
+    if [[ "$got" != "$want" ]]; then
+        die "CHECKSUM MISMATCH — expected $want, got $got. Refusing. Report this."
+    fi
+    echo "  [ok]   SHA-256 of the download matches the release's SHA256SUMS"
+    echo "         $got"
+
+    if [[ -z "$UPDATE_PUBKEY_PEM" ]]; then
+        cat <<EOF
+
+  [STOP] Release signing is NOT yet established for this project, so this build
+         has no publisher key pinned in it and CANNOT verify who produced that
+         SHA256SUMS file. A checksum published next to the file it describes
+         proves the download was not corrupted; it does NOT prove it came from
+         us. Replacing a program on your machine on that basis would be a worse
+         hole than anything this launcher checks for, so tee-claude will not
+         do it.
+
+  The download whose SHA-256 was checked above has been left for you at:
+         $tmp/pkg.tar.gz
+
+  To install $TAG deliberately, after deciding you trust it:
+         cd $tmp
+         tar -tzf pkg.tar.gz          # look at what is in it first
+         tar -xzf pkg.tar.gz && ./mynacloud-client-*/install.sh
+
+  Then delete $tmp.
+
+EOF
+        trap - EXIT
+        exit 3
+    fi
+
+    # --- signed path (inert until UPDATE_PUBKEY_PEM is filled in) -------------
+    need openssl
+    [[ "$SIG_URL" == "-" ]] && die "release $TAG is not signed but this build requires a signature"
+    curl -fsSL --proto '=https' --tlsv1.2 -m 30 "$SIG_URL" -o "$tmp/SHA256SUMS.sig" || die "signature download failed"
+    printf '%s\n' "$UPDATE_PUBKEY_PEM" > "$tmp/pub.pem"
+    if ! openssl pkeyutl -verify -pubin -inkey "$tmp/pub.pem" -rawin \
+                 -in "$tmp/SHA256SUMS" -sigfile "$tmp/SHA256SUMS.sig" >/dev/null 2>&1; then
+        die "SIGNATURE VERIFICATION FAILED for release $TAG. Refusing. Report this."
+    fi
+    echo "  [ok]   SHA256SUMS carries a valid signature from the pinned publisher key"
+
+    tar -xzf "$tmp/pkg.tar.gz" -C "$tmp" || die "extract failed"
+    newroot="$(find "$tmp" -maxdepth 2 -name tee-claude -type f | head -1)"
+    [[ -n "$newroot" ]] || die "the release tarball contains no tee-claude"
+    newroot="$(dirname "$newroot")"
+    for f in tee-claude websearch-mcp.py no-attachment-hook.py; do
+        [[ -f "$newroot/$f" ]] || die "the release tarball is missing $f"
+    done
+    echo
+    echo "  Files that change in $CLIENT_DIR:"
+    for f in tee-claude websearch-mcp.py no-attachment-hook.py policy.example.json install.sh README.md; do
+        [[ -f "$newroot/$f" ]] || continue
+        a="$([[ -f "$CLIENT_DIR/$f" ]] && $SHA256 "$CLIENT_DIR/$f" | awk '{print $1}')"
+        b="$($SHA256 "$newroot/$f" | awk '{print $1}')"
+        [[ "$a" != "$b" ]] && echo "    modified: $f"
+    done
+    echo
+    printf 'Install %s over %s? Type yes or no: ' "$TAG" "$CLIENT_DIR"
+    read -r ans || ans=no
+    [[ "$ans" == "yes" ]] || { echo "Aborted. Nothing was written."; exit 1; }
+    for f in tee-claude websearch-mcp.py no-attachment-hook.py policy.example.json install.sh README.md; do
+        [[ -f "$newroot/$f" ]] || continue
+        # write-to-temp-then-rename, so an interrupted update never leaves a half file
+        cp "$newroot/$f" "$CLIENT_DIR/.$f.new" && mv -f "$CLIENT_DIR/.$f.new" "$CLIENT_DIR/$f"
+    done
+    chmod 755 "$CLIENT_DIR/tee-claude" "$CLIENT_DIR/websearch-mcp.py" \
+              "$CLIENT_DIR/no-attachment-hook.py" 2>/dev/null || true
+    echo "Updated to $TAG."
+    exit 0
+fi
+
+# =============================================================================
+# 0. local policy
+# =============================================================================
+echo
+echo "tee-claude $VERSION — endpoint verification"
+echo
+
+need python3
+
+if [[ ! -f "$POLICY" ]]; then
+    echo "  FATAL: no local policy at $(san "$POLICY")"
+    echo "  Copy policy.example.json -> $CONFIG_DIR/policy.json and edit it."
+    echo
+    echo "  The policy is YOUR file. It pins the endpoint hostname, the TLS"
+    echo "  certificate, and the model you approved. Only the endpoint's TCP"
+    echo "  PORT is discovered at run time (it changes on every restart); the"
+    echo "  hostname and the certificate pins are never taken from the network."
+    exit 2
+fi
+
+# ---- pget: read one dotted key out of the policy ---------------------------
+# The policy PATH and the KEY both cross into Python as argv. Interpolating
+# either one into the program text was a remote-code-execution bug reachable
+# through TEE_CLAUDE_POLICY before any consent gate. [audit A25]
+pget() {
+    python3 - "$POLICY" "$1" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    print(""); sys.exit(0)
+v = d
+for k in sys.argv[2].split("."):
+    v = (v or {}).get(k) if isinstance(v, dict) else None
+if v is None or isinstance(v, (dict, list)):
+    print("")
+else:
+    print(v)
+PY
+}
+
+SCHEME="$(pget endpoint_scheme)";     SCHEME="${SCHEME:-https}"
+HOST="$(pget endpoint_host)"
+STATIC_PORT="$(pget endpoint_port)"
+TXT_RECORD="$(pget port_discovery.record)"
+TXT_KEY="$(pget port_discovery.key)";  TXT_KEY="${TXT_KEY:-port}"
+EXP_MODEL="$(pget model)"
+PIN_SPKI="$(pget tls_spki_sha256)"
+ISSUER_ORG="$(pget expected_issuer_org)"
+ISSUER_CN_RE="$(pget expected_issuer_cn_regex)"
+MIN_TLS="$(pget min_tls_version)";     MIN_TLS="${MIN_TLS:-TLSv1.2}"
+LEGACY_ENDPOINT="$(pget endpoint)"
+
+# A v1 policy pinned a whole URL. Still honoured (the operator's loopback debug
+# policies use it), but it opts out of port discovery, which is stated as such.
+if [[ -z "$HOST" && -n "$LEGACY_ENDPOINT" ]]; then
+    _rest="${LEGACY_ENDPOINT#*://}"
+    SCHEME="${LEGACY_ENDPOINT%%://*}"
+    _hostport="${_rest%%/*}"
+    HOST="${_hostport%%:*}"
+    [[ "$_hostport" == *:* ]] && STATIC_PORT="${_hostport##*:}"
+fi
+
+ver 1 "Local policy parsed: $(basename "$POLICY")"
+if [[ -n "$HOST" && -n "$EXP_MODEL" ]]; then
+    ver 2 "Policy pins endpoint host + model ($HOST / $EXP_MODEL)"
+else
+    fail 2 "Policy must pin both an endpoint host and a model"
+fi
+
+unsup 3 "Launcher release signature (release signing not established yet)"
+if git -C "$CLIENT_DIR" rev-parse --short HEAD >/dev/null 2>&1; then
+    info 4 "Launcher source revision: $(git -C "$CLIENT_DIR" rev-parse --short HEAD)"
+else
+    info 4 "Launcher source revision: not a git checkout (installed release $VERSION)"
+fi
+unsup 5 "Independent reproducible-build quorum (not established)"
+
+# =============================================================================
+# 1. endpoint discovery — the PORT, and only the port, comes from DNS
+# =============================================================================
+# The pod's public IP and its TCP port both change on every restart, and it is
+# restarted every night. The A record is updated at boot; the current port is
+# published as a TXT record.
+#
+# THE HOSTNAME IS NEVER DISCOVERED. It is pinned in this local policy, and every
+# TLS check below runs against the pinned name. The blast radius of someone who
+# can forge or tamper with the TXT record is therefore exactly "move us to a
+# different port on a host we still fully verify" — they cannot redirect the
+# session to a host of their choosing, because a certificate for that host would
+# not validate against the pinned name (check [08]), would not match the pinned
+# SPKI (check [10]) and would not carry the pinned leaf identity (check [11]).
+LOOPBACK=0
+[[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" || "$HOST" == "::1" ]] && LOOPBACK=1
+
+PORT=""
+if [[ -n "${TEE_CLAUDE_PORT:-}" ]]; then
+    if [[ "$TEE_CLAUDE_PORT" =~ ^[0-9]{1,5}$ ]] && (( TEE_CLAUDE_PORT >= 1 && TEE_CLAUDE_PORT <= 65535 )); then
+        PORT="$TEE_CLAUDE_PORT"
+        info 6 "Endpoint port taken from TEE_CLAUDE_PORT=$PORT (DNS discovery skipped; host still pinned)"
+    else
+        fail 6 "TEE_CLAUDE_PORT is not a valid port number"
+    fi
+elif [[ -n "$STATIC_PORT" ]]; then
+    if [[ "$STATIC_PORT" =~ ^[0-9]{1,5}$ ]] && (( STATIC_PORT >= 1 && STATIC_PORT <= 65535 )); then
+        PORT="$STATIC_PORT"
+        info 6 "Endpoint port pinned statically in the policy ($PORT); DNS discovery not used"
+    else
+        fail 6 "Policy 'endpoint_port' is not a valid port number"
+    fi
+elif [[ -z "$TXT_RECORD" ]]; then
+    fail 6 "Policy has neither 'endpoint_port' nor 'port_discovery.record' — cannot locate the endpoint"
+elif [[ "$TXT_RECORD" != "$HOST" && "$TXT_RECORD" != *".$HOST" ]]; then
+    # Encoded invariant: discovery must live under the pinned name, so a policy
+    # typo can never point discovery at a domain the operator does not control.
+    fail 6 "port_discovery.record ($TXT_RECORD) is not under the pinned host ($HOST)"
+else
+    dns_txt() {
+        local out=""
+        if command -v dig >/dev/null 2>&1; then
+            out="$(dig +short +timeout=5 +tries=2 TXT "$1" 2>/dev/null)"
+        fi
+        if [[ -z "$out" ]] && command -v host >/dev/null 2>&1; then
+            out="$(host -W 5 -t TXT "$1" 2>/dev/null | sed -n 's/.*descriptive text //p')"
+        fi
+        if [[ -z "$out" ]] && command -v nslookup >/dev/null 2>&1; then
+            out="$(nslookup -type=TXT "$1" 2>/dev/null | sed -n 's/.*text = //p')"
+        fi
+        printf '%s\n' "$out"
+    }
+    if ! command -v dig >/dev/null 2>&1 && ! command -v host >/dev/null 2>&1 \
+         && ! command -v nslookup >/dev/null 2>&1; then
+        fail 6 "No DNS TXT resolver found (install dig/host/nslookup, or set TEE_CLAUDE_PORT)"
+    else
+        _txt="$(dns_txt "$TXT_RECORD")"
+        PORT="$(printf '%s' "$_txt" | python3 -c "$PY_TXT_PORT" "$TXT_KEY")"
+        if [[ -z "$_txt" ]]; then
+            fail 6 "DNS TXT $TXT_RECORD did not resolve — cannot locate the endpoint (see 'Nightly outage' below)"
+        elif [[ -z "$PORT" ]]; then
+            fail 6 "DNS TXT $TXT_RECORD is missing or ambiguous for '$TXT_KEY=' — refusing to guess"
+        else
+            ver 6 "Endpoint port discovered from DNS TXT $TXT_RECORD ($TXT_KEY=$PORT)"
+        fi
+    fi
+fi
+
+ENDPOINT=""
+[[ -n "$HOST" && -n "$PORT" ]] && ENDPOINT="$SCHEME://$HOST:$PORT"
+
+if [[ -z "$HOST" ]]; then
+    fail 7 "No endpoint host to resolve"
+elif [[ $LOOPBACK -eq 1 ]] || getent hosts "$HOST" >/dev/null 2>&1 \
+     || python3 -c 'import socket,sys; socket.getaddrinfo(sys.argv[1],None)' "$HOST" >/dev/null 2>&1; then
+    ver 7 "Endpoint host resolves: $HOST"
+else
+    fail 7 "Endpoint host does not resolve: $HOST"
+fi
+
+# =============================================================================
+# 2. transport
+# =============================================================================
+LEAF_PEM=""
+if [[ "$SCHEME" == "https" && -n "$PORT" && -n "$HOST" ]]; then
+    # -verify_hostname is the whole point of check [08]. The previous version
+    # printed "chain verified; hostname matches" on the mere presence of a
+    # BEGIN CERTIFICATE line, which any self-signed certificate satisfies.
+    # [audit A26]
+    if ! openssl s_client -help 2>&1 | grep -q -- '-verify_hostname'; then
+        fail 8  "This openssl cannot verify hostnames (-verify_hostname unsupported) — refusing to claim it did"
+        fail 9  "TLS version/cipher not established"
+        fail 10 "TLS SPKI not obtained"
+        fail 11 "Certificate identity not established"
+        fail 12 "Certificate validity not established"
+    else
+    tls_out="$(echo | timeout 20 openssl s_client -connect "$HOST:$PORT" -servername "$HOST" \
+                 -verify_hostname "$HOST" -verify_return_error -verify 6 2>&1)"
+    LEAF_PEM="$(sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' <<<"$tls_out" \
+                | sed '/-----END CERTIFICATE-----/q')"
+    if [[ -n "$LEAF_PEM" ]] && grep -q 'Verify return code: 0 (ok)' <<<"$tls_out"; then
+        ver 8 "TLS handshake OK; chain verified to a system root; hostname matches $HOST"
+
+        tlsver="$(grep -m1 -oE 'TLSv1\.[0-9]' <<<"$tls_out" | head -1)"
+        cipher="$(grep -m1 'Cipher *:' <<<"$tls_out" | awk '{print $NF}')"
+        _rank() { case "$1" in TLSv1.3) echo 4;; TLSv1.2) echo 3;; TLSv1.1) echo 2;; TLSv1.0) echo 1;; *) echo 0;; esac; }
+        if (( $(_rank "$tlsver") >= $(_rank "$MIN_TLS") )) && (( $(_rank "$tlsver") > 0 )); then
+            ver 9 "TLS $tlsver, cipher $cipher (policy floor $MIN_TLS)"
+        else
+            fail 9 "TLS version below the policy floor $MIN_TLS (got ${tlsver:-unknown})"
+        fi
+
+        spki="$(printf '%s\n' "$LEAF_PEM" | openssl x509 -noout -pubkey 2>/dev/null \
+                | openssl pkey -pubin -outform der 2>/dev/null \
+                | openssl dgst -sha256 -hex 2>/dev/null | awk '{print $NF}')"
+        if [[ -z "$PIN_SPKI" || "$PIN_SPKI" == "REPLACE-ME" ]]; then
+            # Unpinned used to be INFORMATIONAL. It is a FAILED: the product's
+            # pitch is verification, and an unpinned key means the only thing
+            # standing between you and any CA-issued certificate for this name
+            # is the public CA system. Get the published pin, or run
+            # `tee-claude --print-spki` and pin what you see after checking it
+            # against the value the operator publishes.
+            fail 10 "TLS SPKI is not pinned in your policy (tls_spki_sha256 is empty or REPLACE-ME) — see --print-spki"
+        elif [[ "$spki" == "$PIN_SPKI" ]]; then
+            ver 10 "TLS SPKI matches the policy pin"
+        else
+            fail 10 "TLS SPKI does NOT match the policy pin (expected ${PIN_SPKI:0:16}..., got ${spki:0:16}...)"
+        fi
+
+        # ---- [11] this certificate is OURS, not merely a valid one ----------
+        # WHY THIS EXISTS, in one specific scenario: the A record for this host
+        # is on Cloudflare. Today it is DNS-only ("grey cloud") and the TLS
+        # session terminates on our own pod. If that record is ever flipped to
+        # proxied ("orange cloud") — by an operator mistake, or by anyone who
+        # gets into the Cloudflare account — Cloudflare terminates TLS itself
+        # and presents ITS certificate. The chain would still verify, the
+        # hostname would still match, and check [08] would still pass, while
+        # every prompt and every response was readable in plaintext by a third
+        # party we never disclosed. That failure is invisible to a generic TLS
+        # check and must be loud, so we assert the issuer and the leaf identity
+        # we actually expect. (The SPKI pin at [10] catches the same thing; this
+        # check survives our own certificate renewals, which the SPKI pin does
+        # not, so we want both.)
+        if [[ -z "$ISSUER_ORG" && -z "$ISSUER_CN_RE" ]]; then
+            fail 11 "Policy pins no expected certificate issuer (expected_issuer_org) — refusing to skip the check"
+        else
+            _idres="$(printf '%s\n' "$LEAF_PEM" \
+                | openssl x509 -noout -issuer -subject -ext subjectAltName -nameopt RFC2253 2>/dev/null \
+                | ISSUER_ORG="$ISSUER_ORG" ISSUER_CN_RE="$ISSUER_CN_RE" python3 -c "$PY_CERT_ID" "$HOST")"
+            if [[ "$_idres" == OK* ]]; then
+                ver 11 "Certificate is ours: ${_idres#OK }"
+            else
+                fail 11 "Certificate is NOT the expected one: ${_idres#FAIL }  (if this host was just put behind a TLS-terminating proxy, STOP)"
+            fi
+        fi
+
+        if printf '%s\n' "$LEAF_PEM" | openssl x509 -noout -checkend 0 >/dev/null 2>&1; then
+            ver 12 "Certificate within its validity window"
+        else
+            fail 12 "Certificate expired or not yet valid"
+        fi
+    else
+        _why="$(grep -m1 -E 'Verification error|verify error|Verify return code' <<<"$tls_out" | head -1)"
+        fail 8  "TLS handshake, chain or hostname verification failed${_why:+ — $_why}"
+        fail 9  "TLS version/cipher not established"
+        fail 10 "TLS SPKI not obtained"
+        fail 11 "Certificate identity not established"
+        fail 12 "Certificate validity not established"
+    fi
+    fi
+elif [[ $LOOPBACK -eq 1 ]]; then
+    info 8  "Loopback endpoint — TLS not applicable (no network exposure)"
+    info 9  "Loopback endpoint — TLS version/cipher not applicable"
+    info 10 "Loopback endpoint — TLS SPKI not applicable"
+    info 11 "Loopback endpoint — certificate identity not applicable"
+    info 12 "Loopback endpoint — certificate validity not applicable"
+elif [[ -z "$PORT" ]]; then
+    fail 8  "No endpoint port — TLS not attempted"
+    fail 9  "No TLS"; fail 10 "No TLS"; fail 11 "No TLS"; fail 12 "No TLS"
+else
+    fail 8  "Plaintext http:// to a NON-loopback host — refusing (prompts would transit in clear)"
+    fail 9  "No TLS"; fail 10 "No TLS"; fail 11 "No TLS"; fail 12 "No TLS"
+fi
+
+# ---- --print-spki: an operator/customer helper, prints and exits -----------
+if [[ "${1:-}" == "--print-spki" ]]; then
+    echo
+    if [[ -n "$LEAF_PEM" ]]; then
+        echo "tls_spki_sha256 for $HOST:$PORT"
+        printf '%s\n' "$LEAF_PEM" | openssl x509 -noout -pubkey \
+            | openssl pkey -pubin -outform der | openssl dgst -sha256 -hex | awk '{print "  " $NF}'
+        echo
+        echo "Compare this against the value the operator publishes BEFORE you put it"
+        echo "in your policy. Pinning whatever you happen to see is trust-on-first-use,"
+        echo "which is strictly weaker."
+    else
+        echo "No certificate was obtained; nothing to print."
+    fi
+    exit 0
+fi
+
+# =============================================================================
+# 3. credential — presence only. Nothing is sent yet. [audit A29]
+# =============================================================================
+TOKEN="${ANTHROPIC_AUTH_TOKEN:-}"
+if [[ -z "$TOKEN" && -f "$CONFIG_DIR/token" ]]; then
+    _mode="$(stat -c '%a' "$CONFIG_DIR/token" 2>/dev/null || stat -f '%Lp' "$CONFIG_DIR/token" 2>/dev/null || echo "")"
+    if [[ -n "$_mode" && "${_mode: -2}" != "00" ]]; then
+        echo "  warning: $CONFIG_DIR/token is mode $_mode — run: chmod 600 $CONFIG_DIR/token" >&2
+    fi
+    TOKEN="$(tr -d '[:space:]' < "$CONFIG_DIR/token")"
+fi
+if [[ -z "$TOKEN" ]]; then
+    fail 13 "No credential — set ANTHROPIC_AUTH_TOKEN or write $CONFIG_DIR/token"
+elif [[ ! "$TOKEN" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
+    # The credential is handed to curl through a config file on stdin, whose
+    # quoting we must not be able to break out of. Real keys are in this
+    # alphabet; anything else is a mistake or an attack, so refuse rather than
+    # escape-and-hope.
+    fail 13 "Credential contains characters outside the expected key alphabet — refusing to use it"
+    TOKEN=""
+else
+    ver 13 "Session credential present (${#TOKEN} chars; never printed, never on a command line)"
+fi
+
+# =============================================================================
+# 4. TEE-rooted claims — unprovable without a Confidential VM + CC GPU
+# =============================================================================
+unsup 14 "Google Confidential VM attestation token"
+unsup 15 "GCP project / instance / zone identity"
+unsup 16 "Confidential Computing technology + Secure Boot state"
+unsup 17 "NVIDIA GPU detached-EAT signature"
+unsup 18 "NVIDIA device identity, CC mode, debug state"
+unsup 19 "NVIDIA RIM / certificate chain / revocation"
+unsup 20 "TPM quote signature and freshness"
+unsup 21 "PCR replay against measured-boot log"
+unsup 22 "IMA measurement-log replay"
+unsup 23 "Running OCI image digest == customer-approved digest"
+unsup 24 "OCI signature + transparency-log inclusion"
+unsup 25 "Image-to-published-source revision binding"
+unsup 26 "Measured LiteLLM configuration"
+unsup 27 "Measured no-retention policy"
+unsup 28 "Measured mount / writable-storage policy"
+unsup 29 "Measured swap / core-dump / persistent-journal policy"
+unsup 30 "Measured data-plane egress isolation"
+unsup 31 "Model manifest digest approved from measured state"
+unsup 32 "TLS key bound to attested environment"
+unsup 33 "Session-token proof-of-possession binding"
+unsup 34 "Deployment-policy approval from measured state"
+
+# =============================================================================
+# 5. client-side web search — configuration only, no network, no credential
+# =============================================================================
+SEARCH_MCP="$CLIENT_DIR/websearch-mcp.py"
+MCPCFG="$CONFIG_DIR/mcp.json"
+SEARCH_TOOL="mcp__websearch__web_search"
+SEARCH_ENABLED=0
+SEARCH_DISCLOSE="none — web search is disabled"
+
+if [[ "${TEE_CLAUDE_SEARCH:-on}" == "off" ]]; then
+    info 35 "Client-side web search: disabled by TEE_CLAUDE_SEARCH=off"
+elif [[ ! -f "$SEARCH_MCP" ]]; then
+    info 35 "Client-side web search: unavailable (websearch-mcp.py not found next to the launcher)"
+else
+    # search.env used to be `.`-sourced, which is arbitrary shell execution out
+    # of a file this script does not own and never checks. It is now parsed, not
+    # executed: only KEY=VALUE lines, only from a known set of keys, and only
+    # from a file owned by you and not writable by anyone else. [audit, 2026-07-25]
+    SEARCH_ENV="$CONFIG_DIR/search.env"
+    if [[ -f "$SEARCH_ENV" ]]; then
+        _uid="$(id -u)"
+        _owner="$(stat -c '%u' "$SEARCH_ENV" 2>/dev/null || stat -f '%u' "$SEARCH_ENV" 2>/dev/null || echo -1)"
+        _mode="$(stat -c '%a' "$SEARCH_ENV" 2>/dev/null || stat -f '%Lp' "$SEARCH_ENV" 2>/dev/null || echo 777)"
+        _mode="$(printf '%03d' "$((10#${_mode: -3}))" 2>/dev/null || echo 777)"
+        if [[ "$_owner" != "$_uid" && "$_owner" != "0" ]]; then
+            echo "  note: ignoring $SEARCH_ENV — it is owned by uid $_owner, not by you" >&2
+        elif (( (10#${_mode:1:1} & 2) || (10#${_mode:2:1} & 2) )); then
+            echo "  note: ignoring $SEARCH_ENV — mode $_mode is group/world-writable. Run: chmod 600 $SEARCH_ENV" >&2
+        else
+            while IFS= read -r _line; do
+                case "$_line" in
+                    WEBSEARCH_PROVIDER=*|WEBSEARCH_TIMEOUT=*|BRAVE_API_KEY=*|TAVILY_API_KEY=*|SEARXNG_URL=*)
+                        _k="${_line%%=*}"; _v="${_line#*=}"
+                        _v="${_v%\"}"; _v="${_v#\"}"; _v="${_v%\'}"; _v="${_v#\'}"
+                        export "$_k=$_v" ;;
+                esac
+            done < <(LC_ALL=C tr -d '\000-\010\013\014\016-\037\177' < "$SEARCH_ENV")
+        fi
+    fi
+    SEARCH_CHAIN="$(python3 "$SEARCH_MCP" --selftest 2>/dev/null | sed -n 's/^provider chain *: //p')"
+    SEARCH_CHAIN="$(san "${SEARCH_CHAIN:-unknown}")"
+    SEARCH_ENABLED=1
+    SEARCH_DISCLOSE="$SEARCH_CHAIN (tried in that order), plus any site fetched with WebFetch"
+    ver 35 "Client-side web search available (local process; providers: $SEARCH_CHAIN)"
+    [[ "$SEARCH_CHAIN" == *ddgs* ]] || \
+        info 36 "Search quality: 'pip install ddgs' gives multi-engine keyless search, or set BRAVE_API_KEY / TAVILY_API_KEY / SEARXNG_URL in $CONFIG_DIR/search.env"
+fi
+
+# =============================================================================
+# 6. summary + disclosure
+# =============================================================================
+cat <<SUMMARY
+
+============================================================
+CONFIDENTIAL INFERENCE VERIFICATION SUMMARY
+============================================================
+
+Endpoint (hostname pinned by your policy; port discovered at launch):
+  ${ENDPOINT:-<not established>}
+
+Model you have approved in your policy (NOT an Anthropic model):
+  $EXP_MODEL
+
+Checks so far:
+  VERIFIED:      $n_ver
+  FAILED:        $n_fail
+  UNSUPPORTED:   $n_unsup
+  INFORMATIONAL: $n_info
+
+Provider-word-only assumptions for scoped data-plane claims:
+  $n_unsup   (every UNSUPPORTED check above is one)
+
+Not yet checked: everything that requires sending your credential.
+Your token is NOT transmitted until you consent below. The endpoint is
+then authenticated and the served model is compared with your policy
+(checks [37]-[38]); a failure there still refuses to launch.
+
+External trust roots you are relying on:
+  - This machine, its OS and cryptographic libraries
+  - The endpoint operator (no hardware attestation available)
+  - Web PKI for TLS certificate validation, and the DNS resolver this
+    machine uses for the endpoint's current port (the HOSTNAME and the
+    certificate pins come from your local policy, never from the network)
+  - Correctness of the reviewed open source
+
+------------------------------------------------------------
+ALPHA — LIMITED VERIFICATION
+------------------------------------------------------------
+During alpha, privacy properties are enforced by
+configuration and inspectable open source — they are
+NOT cryptographically provable. Prompts and responses
+are not logged or stored. The operator retains the
+technical ability to access data in memory.
+
+NIGHTLY OUTAGE — this is not a highly available service.
+The machine is powered OFF every night and restarted the
+next day. That is a hard outage with no drain: an
+in-flight response is truncated mid-stream, the session
+stops, and the endpoint refuses connections until the
+model has finished loading again (currently on the order
+of twenty minutes after power-on). Its IP address and TCP
+port BOTH change on every restart, which is why this
+launcher re-reads DNS every time you start it. If a
+connection check above failed, the most likely
+explanation is simply that the machine is off. Do not
+plan work around this endpoint being reachable.
+
+IMAGES AND PDFs — known limitation, partially unfixable.
+This deployment has no vision, and PDFs are dropped in
+transit. If the model receives one it will answer about
+it CONFIDENTLY AND WRONGLY rather than error. This
+launcher blocks the paths it can see: Read, Bash file
+dumps, MCP file tools and @-mentions of image/PDF files.
+It CANNOT block an image you paste or drag straight into
+the prompt — that never becomes a tool call, so no
+client-side hook can intercept it. If you paste a
+screenshot, the description you get back is invented.
+Convert to text first (pdftotext, or describe it
+yourself).
+
+Web access runs on THIS machine, not on the endpoint.
+Web search and page fetches are performed by local
+processes using your own IP address and your own
+(optional) search-provider key — the inference endpoint
+never receives a search query and never fetches a page
+on your behalf. In exchange, the search terms your
+assistant chooses, and the addresses of pages it reads,
+are visible to whichever search engine and websites are
+contacted: $SEARCH_DISCLOSE.
+Disable web search entirely with TEE_CLAUDE_SEARCH=off.
+
+Do not send data you cannot afford to expose.
+============================================================
+SUMMARY
+
+# =============================================================================
+# 7. gate — FAILED is absolute, in every mode, with no override
+# =============================================================================
+if (( n_fail > 0 )); then
+    echo
+    echo "Cannot proceed: $n_fail mandatory check(s) FAILED."
+    printf '  %s\n' "${FAILED_DETAIL[@]}"
+    echo "Claude Code will not be launched."
+    exit 1
+fi
+
+if (( VERIFY_ONLY )); then
+    echo
+    echo "(--verify-only: not launching Claude Code; checks [37]+ need your credential"
+    echo " and are therefore not run here)"
+    exit 0
+fi
+
+# Consent. Default is 'no' on EOF, on timeout, and when stdin is not a terminal.
+# There is deliberately no non-interactive consent variable: a launcher whose
+# entire product is "a human read this and agreed" must not have a way to agree
+# on the human's behalf, and a debugging convenience is exactly how such a
+# variable ends up in a customer's shell profile. [audit A28]
+echo
+if [[ ! -t 0 ]]; then
+    echo "Refusing to proceed: stdin is not a terminal, so consent cannot be given."
+    echo "Run tee-claude from an interactive shell. (--verify-only works headless.)"
+    exit 1
+fi
+printf 'Proceed with this coding session? Type yes or no: '
+if ! read -r -t 300 answer; then answer="no"; fi
+case "${answer:-no}" in
+    yes) : ;;
+    *) echo "Aborted. No session started."; exit 1 ;;
+esac
+
+# =============================================================================
+# 8. post-consent checks — the first thing that sends your credential
+# =============================================================================
+mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR" 2>/dev/null || true
+echo
+echo "Contacting the endpoint (first use of your credential):"
+
+# The token is passed to curl in a config file fed on stdin, so it never appears
+# in this process's argv — /proc/<pid>/cmdline is readable by other uids on a
+# shared machine, /proc/<pid>/environ and a pipe are not. [audit A29]
+acurl() { printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -sS -K - "$@"; }
+
+probe="$(acurl -m 25 -o /dev/null -w '%{http_code}' "$ENDPOINT/v1/models" 2>/dev/null)"
+SRV_MODEL=""; SRV_NAME=""; SRV_DESC=""; SRV_CTX=""; SRV_OUT=""
+case "$probe" in
+  200)
+    meta="$(acurl -m 25 "$ENDPOINT/v1/model/info" 2>/dev/null | python3 -c "$PY_MODEL_INFO")"
+    IFS=$'\t' read -r SRV_MODEL SRV_NAME SRV_DESC SRV_CTX SRV_OUT <<<"${meta:-}"
+    if [[ -n "${SRV_MODEL:-}" ]]; then
+        ver 37 "Endpoint authenticated; it reports it is serving: ${SRV_NAME:-$SRV_MODEL}"
+    else
+        served="$(acurl -m 25 "$ENDPOINT/v1/models" 2>/dev/null | python3 -c "$PY_MODEL_LIST")"
+        if [[ -n "$served" ]]; then
+            ver 37 "Endpoint authenticated; it reports it is serving: $served"
+            SRV_MODEL="${served%%,*}"
+        else
+            fail 37 "Endpoint authenticated but advertised no model"
+        fi
+    fi ;;
+  401|403) fail 37 "Endpoint rejected the credential (HTTP $probe)" ;;
+  000|"")  fail 37 "Endpoint did not respond — it is very likely powered off (see the nightly-outage note above)" ;;
+  *)       fail 37 "Endpoint probe failed (HTTP $probe)" ;;
+esac
+
+# ---- [38] served model vs the model you approved ---------------------------
+# An earlier version REWROTE this file with whatever the endpoint said, with no
+# diff and no consent, while the fatal-error text above told the customer the
+# policy "is never fetched from the endpoint being verified". Both cannot be
+# true. What happens now: a human-readable diff, one typed confirmation, and a
+# .bak so a later silent rollback is detectable. Note what is and is not
+# negotiable: the endpoint may propose a different MODEL and you may accept it;
+# it can never move the hostname, the certificate pins or the issuer expectation,
+# which are the things that make "this is our endpoint" mean anything.
+MODEL_ID="$EXP_MODEL"; MODEL_NAME="$EXP_MODEL"; MODEL_DESC=""
+CTX_WINDOW="$(pget context_window)"; OUT_TOKENS="$(pget max_output_tokens)"
+
+if (( n_fail == 0 )) && [[ -n "$SRV_MODEL" ]]; then
+    if [[ "$SRV_MODEL" == "$EXP_MODEL" ]]; then
+        ver 38 "Served model matches the model in your policy"
+        MODEL_NAME="${SRV_NAME:-$EXP_MODEL}"; MODEL_DESC="${SRV_DESC:-}"
+        [[ -n "${SRV_CTX:-}" ]] && CTX_WINDOW="$SRV_CTX"
+        [[ -n "${SRV_OUT:-}" ]] && OUT_TOKENS="$SRV_OUT"
+    else
+        info 38 "Served model DIFFERS from the model in your policy — your approval is required"
+        cat <<DIFF
+
+------------------------------------------------------------
+THE OPERATOR HAS CHANGED THE SERVED MODEL
+------------------------------------------------------------
+  model            $(san "$EXP_MODEL")
+                ->  $(san "$SRV_MODEL")
+  display name  ->  $(san "${SRV_NAME:-$SRV_MODEL}")
+  context        $(san "${CTX_WINDOW:-unknown}")
+                ->  $(san "${SRV_CTX:-unchanged}")
+  max output     $(san "${OUT_TOKENS:-unknown}")
+                ->  $(san "${SRV_OUT:-unchanged}")
+  description   ->  $(san "${SRV_DESC:-none}")
+
+This is a different model from the one you approved. Its capabilities,
+its training and its alignment may all differ. Accepting rewrites
+$(san "$POLICY") and keeps the previous file as
+$(san "$POLICY").bak so a later silent rollback is detectable.
+------------------------------------------------------------
+DIFF
+        printf 'Accept this model change? Type yes or no: '
+        if ! read -r -t 300 mans; then mans="no"; fi
+        if [[ "$mans" != "yes" ]]; then
+            echo "Declined. No session started, and your policy was not modified."
+            exit 1
+        fi
+        cp -p "$POLICY" "$POLICY.bak" 2>/dev/null || true
+        if python3 - "$POLICY" "$SRV_MODEL" "${SRV_CTX:-}" "${SRV_OUT:-}" <<'PY'
+import json, sys
+p, m, c, o = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+try:
+    d = json.load(open(p, encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+d["model"] = m
+if c.isdigit(): d["context_window"] = int(c)
+if o.isdigit(): d["max_output_tokens"] = int(o)
+tmp = p + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")
+import os; os.replace(tmp, p)
+PY
+        then
+            echo "Recorded. Previous policy saved as $POLICY.bak"
+        else
+            echo "Could not rewrite $POLICY — aborting rather than running on an unrecorded model."
+            exit 1
+        fi
+        MODEL_ID="$SRV_MODEL"; MODEL_NAME="${SRV_NAME:-$SRV_MODEL}"; MODEL_DESC="${SRV_DESC:-}"
+        [[ -n "${SRV_CTX:-}" ]] && CTX_WINDOW="$SRV_CTX"
+        [[ -n "${SRV_OUT:-}" ]] && OUT_TOKENS="$SRV_OUT"
+    fi
+fi
+
+if (( n_fail > 0 )); then
+    echo
+    echo "Cannot proceed: $n_fail mandatory check(s) FAILED."
+    printf '  %s\n' "${FAILED_DETAIL[@]}"
+    echo "Claude Code will not be launched."
+    exit 1
+fi
+
+# =============================================================================
+# 9. bridge environment + launch
+# =============================================================================
+SETTINGS="$CONFIG_DIR/settings.json"
+
+# --- Client-side web search -------------------------------------------------
+# The built-in WebSearch stays DENIED, and that is not a compromise — it is the
+# only correct setting. WebSearch is not a client-side tool: it executes by
+# issuing a nested /v1/messages call carrying Anthropic's server-side
+# `web_search_20250305` tool and then reading `server_tool_use` /
+# `web_search_tool_result` blocks out of the reply. Our backend never emits
+# those, so the nested call collapses into "answer from memory" and Claude Code
+# renders the model's recollection as if it were a search hit. Denying it
+# converts a silent fabrication into a loud "not enabled here".
+#
+# In its place we register an MCP stdio server. Claude Code spawns stdio MCP
+# servers as ordinary local child processes, so the HTTP request to the search
+# provider originates on THIS machine, with the user's own IP and the user's own
+# (optional) provider credential. The provider credential is referenced as
+# ${VAR}, which Claude Code expands from its OWN process environment when it
+# loads this file — so the key never lands in mcp.json, and never in a log.
+#
+# Both JSON files below are emitted by a JSON encoder from argv, not by a shell
+# heredoc: a home directory containing a quote or a backslash used to produce
+# either invalid JSON or an injected settings key. [same class as audit A25]
+if (( SEARCH_ENABLED )); then
+    python3 - "$MCPCFG" "$SEARCH_MCP" <<'PY'
+import json, sys
+cfg = {"mcpServers": {"websearch": {
+    "type": "stdio",
+    "command": "python3",
+    "args": [sys.argv[2]],
+    "env": {
+        "WEBSEARCH_PROVIDER": "${WEBSEARCH_PROVIDER:-auto}",
+        "WEBSEARCH_TIMEOUT": "${WEBSEARCH_TIMEOUT:-25}",
+        "BRAVE_API_KEY": "${BRAVE_API_KEY:-}",
+        "TAVILY_API_KEY": "${TAVILY_API_KEY:-}",
+        "SEARXNG_URL": "${SEARXNG_URL:-}",
+    },
+}}}
+json.dump(cfg, open(sys.argv[1], "w"), indent=2)
+PY
+    chmod 600 "$MCPCFG" 2>/dev/null || true
+fi
+
+# The MCP tool name is structural (mcp__<server>__<tool>) and the built-in name is
+# not repointable, so the model has to be told the replacement exists. Static text,
+# which keeps the vLLM prefix cache warm.
+if (( SEARCH_ENABLED )); then
+    SEARCH_PROMPT="Web search in this session is provided by the ${SEARCH_TOOL} tool, \
+which runs locally on the user's machine. The built-in WebSearch tool is disabled and \
+will fail if you call it — use ${SEARCH_TOOL} instead whenever you need current \
+information from the internet, then use WebFetch to read any returned URL in full. "
+else
+    SEARCH_PROMPT="Web search is disabled in this session. The built-in WebSearch tool \
+will fail if you call it. Say that you cannot search the web rather than answering from \
+memory as though you had. "
+fi
+SEARCH_PROMPT+="This deployment has no vision and cannot read PDFs. Never describe the \
+contents of an image or a PDF. If the user refers to a screenshot, a diagram or a PDF, \
+say plainly that you cannot see it and ask for the content as text — do not guess."
+
+# --- Attachment interception -------------------------------------------------
+# The hook is registered against every tool that can put file BYTES in front of
+# the model, not just Read:
+#   Read / NotebookRead   the obvious path
+#   Bash                  `cat`/`head`/`base64` reach the same bytes
+#   mcp__.*               filesystem MCP servers have their own read tools
+# and as a UserPromptSubmit hook for `@`-mentions, which expand into content
+# without ever becoming a tool call.
+#
+# What this CANNOT cover, stated plainly rather than papered over: an image
+# pasted or dragged directly into the prompt box. Claude Code turns it into an
+# image content block at submit time; it is not a tool call and it is not part
+# of the prompt text a UserPromptSubmit hook receives, so there is no client-side
+# interception point at all. That gap is disclosed in the consent text above and
+# in the README. [audit A33]
+python3 - "$SETTINGS" "$CLIENT_DIR/no-attachment-hook.py" "$SEARCH_TOOL" "$SEARCH_ENABLED" <<'PY'
+import json, sys
+settings_path, hook, search_tool, search_on = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+# The hook command is a string a shell will run, so single-quote the path and
+# POSIX-escape any embedded quote. A home directory containing a quote used to
+# produce invalid JSON here, or worse.
+hook_cmd = "python3 '%s'" % hook.replace("'", "'\\''")
+s = {
+    "skipWebFetchPreflight": True,
+    "includeCoAuthoredBy": False,
+    "disableAutoMode": "disable",
+    "hooks": {
+        "PreToolUse": [{
+            "matcher": "Read|NotebookRead|Bash|mcp__.*",
+            "hooks": [{"type": "command", "command": hook_cmd}],
+        }],
+        "UserPromptSubmit": [{
+            "hooks": [{"type": "command", "command": hook_cmd + " --prompt"}],
+        }],
+    },
+    "switchModelsOnFlag": False,
+    "permissions": {"deny": ["WebSearch"]},
+}
+if search_on:
+    s["permissions"]["allow"] = [search_tool]
+with open(settings_path, "w", encoding="utf-8") as f:
+    json.dump(s, f, indent=2)
+    f.write("\n")
+PY
+chmod 600 "$SETTINGS" 2>/dev/null || true
+
+export ANTHROPIC_BASE_URL="$ENDPOINT"
+export ANTHROPIC_AUTH_TOKEN="$TOKEN"
+unset ANTHROPIC_API_KEY                             # both headers at once can 401 the gateway
+export ANTHROPIC_MODEL="$MODEL_ID"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL_ID"    # single deployment -> avoids background-call 404s
+export ANTHROPIC_SMALL_FAST_MODEL="$MODEL_ID"       # legacy name, still read by 2.1.x
+export ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME="$MODEL_NAME"
+export ANTHROPIC_CUSTOM_MODEL_OPTION="$MODEL_ID"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="$MODEL_NAME"
+[[ -n "${MODEL_DESC:-}" ]] && export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="$MODEL_DESC"
+# CONTEXT WINDOW — order matters, and AUTO_COMPACT_WINDOW alone is NOT enough.
+# CC clamps it: window = min(Xv(model), value), and Xv() returns a hardcoded 200000 for any
+# model id it does not recognise. CLAUDE_CODE_MAX_CONTEXT_TOKENS is the variable that actually
+# raises the ceiling, and it is honoured ONLY when the model id does not start with "claude-".
+[[ -n "${CTX_WINDOW:-}" ]] && export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CTX_WINDOW"
+[[ -n "${CTX_WINDOW:-}" ]] && export CLAUDE_CODE_AUTO_COMPACT_WINDOW="$CTX_WINDOW"
+[[ -n "${OUT_TOKENS:-}" ]] && export CLAUDE_CODE_MAX_OUTPUT_TOKENS="$OUT_TOKENS"
+
+# Close two latent hazards of the same shape as the WebSearch fabrication bug:
+#   - advisor_20260301 is a server-side tool appended the moment an advisor model is set.
+#   - auto mode / model switching can move us off the single deployment we actually serve.
+export CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1
+export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1  # non-streaming fallback can re-execute tools
+export CLAUDE_CODE_ATTRIBUTION_HEADER=0             # keeps vLLM prefix caching effective
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1
+# NOTE: we deliberately do NOT unset proxy variables. Clearing http_proxy/https_proxy
+# propagates to every child process — git, gh, npm, and our own search MCP server — so a
+# customer whose only route to the internet is a corporate proxy would find the endpoint
+# unreachable with nothing to explain why.
+
+command -v claude >/dev/null 2>&1 || { echo "FATAL: 'claude' not found on PATH"; exit 127; }
+
+CC_ARGS=(--settings "$SETTINGS")
+if (( SEARCH_ENABLED )); then
+    CC_ARGS+=(--mcp-config "$MCPCFG")
+    # We inject our search server, but we do NOT exclude the customer's own MCP servers by
+    # default: --strict-mcp-config makes Claude Code refuse to start at all when an enterprise
+    # managed-mcp.json is present, and silently drops plugin-provided servers, which presents
+    # to the model as "that tool does not exist". Opt in with TEE_CLAUDE_STRICT_MCP=1.
+    [[ "${TEE_CLAUDE_STRICT_MCP:-}" == "1" ]] && CC_ARGS+=(--strict-mcp-config)
+fi
+# --append-system-prompt is last-wins in Claude Code, so if the caller passes their own we
+# must not clobber it.
+if [[ " $* " != *" --append-system-prompt "* ]]; then
+    CC_ARGS+=(--append-system-prompt "$SEARCH_PROMPT")
+else
+    echo "note: caller supplied --append-system-prompt; skipping our tool-usage hint." >&2
+fi
+exec claude "${CC_ARGS[@]}" "$@"
