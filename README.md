@@ -181,10 +181,16 @@ show is inflated by roughly that factor. A measured session:
 | one session | 125,128 | 793 | **$0.64547** | **$0.01774** |
 | four sessions | | | **$6.20** | **$0.386** |
 
-Nothing you can set fixes this. Claude Code has no setting, environment variable or policy key
-that supplies a price for a model it does not know, and the cost the endpoint returns in the
-response (below) is not something Claude Code reads. Read `/cost` as a token counter with the
-wrong multiplier, and divide by ~36 if you want a rough figure.
+Claude Code knows it is guessing: when this happens it appends *"(costs may be inaccurate due
+to usage of unknown models)"* to the total in the end-of-session summary. That warning is the
+only signal you get, and `/cost` itself does not carry it.
+
+**Nothing you can set fixes this.** There is no setting, environment variable or policy key
+that supplies a price for a model Claude Code does not ship a price for — it takes per-model
+rates only from a table compiled into the binary, or from account configuration delivered by
+Anthropic's own API, and neither can describe this model. The cost this endpoint returns in
+the response headers (below) is not something Claude Code reads. Read `/cost` as a token
+counter with the wrong multiplier, and divide by ~36 if you want a rough figure.
 
 **The billing figure comes from the endpoint.** Every completion response carries it in the
 headers:
