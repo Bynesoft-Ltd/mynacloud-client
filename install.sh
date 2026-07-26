@@ -3,9 +3,18 @@
 # install.sh — put tee-claude and its two helper programs on this machine.
 #
 # It copies four files, makes a symlink, creates ~/.tee-claude with mode 700 and
-# (only if you do not already have one) seeds a policy from the example. It does
-# not download anything, does not touch anything outside your home directory,
-# and does not need root. Read it — it is short on purpose.
+# (only if you do not already have one) seeds a policy from the example. It touches
+# nothing outside your home directory and does not need root. Read it — it is short
+# on purpose.
+#
+# TWO MODES.
+#   next to the files   — installs what is beside it. No network at all.
+#   on its own          — fetches the release TARBALL and its SHA256SUMS and verifies
+#                         the checksum before unpacking anything, so `curl -O` this one
+#                         file and run it. That is the same discipline `tee-claude
+#                         --update` uses, and it is why this is not a `curl | bash`:
+#                         piping straight into a shell means the thing you audited and
+#                         the thing that ran are different fetches. Download, read, run.
 # =============================================================================
 set -euo pipefail
 
@@ -46,8 +55,55 @@ if ! command -v claude >/dev/null 2>&1; then
     warn "    npm install -g @anthropic-ai/claude-code"
 fi
 
-# ---- files -----------------------------------------------------------------
-for f in tee-claude websearch-mcp.py no-attachment-hook.py policy.example.json; do
+# ---- files: local beside us, or a verified release download ----------------
+REPO_SLUG="${MYNACLOUD_REPO:-Bynesoft-Ltd/mynacloud-client}"
+NEED=(tee-claude websearch-mcp.py no-attachment-hook.py policy.example.json)
+
+have_all_local=1
+for f in "${NEED[@]}"; do [[ -f "$SRC/$f" ]] || have_all_local=0; done
+
+if (( ! have_all_local )); then
+    # sha256sum on Linux, shasum -a 256 on macOS. Refuse rather than skip: an unverified
+    # tarball is the one thing this installer must not unpack.
+    if command -v sha256sum >/dev/null 2>&1;  then SHA() { sha256sum "$1" | awk '{print $1}'; }
+    elif command -v shasum >/dev/null 2>&1;   then SHA() { shasum -a 256 "$1" | awk '{print $1}'; }
+    else die "need sha256sum or shasum to verify the download"; fi
+
+    VERSION="${MYNACLOUD_VERSION:-}"
+    if [[ -z "$VERSION" ]]; then
+        say "resolving the latest release of $REPO_SLUG"
+        VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO_SLUG/releases/latest" \
+                   | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name",""))' 2>/dev/null || true)"
+        [[ -n "$VERSION" ]] || die "could not resolve the latest release; pass MYNACLOUD_VERSION=vX.Y.Z"
+    fi
+    say "version  $VERSION"
+
+    TMP="$(mktemp -d)"; chmod 700 "$TMP"; trap 'rm -rf "$TMP"' EXIT
+    BASE="https://github.com/$REPO_SLUG/releases/download/$VERSION"
+    TARBALL="mynacloud-client-$VERSION.tar.gz"
+
+    curl -fsSL -o "$TMP/$TARBALL" "$BASE/$TARBALL" || die "could not download $TARBALL"
+    curl -fsSL -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS" || die "could not download SHA256SUMS"
+
+    want="$(awk -v f="$TARBALL" '$2 == f || $2 == "*"f {print $1}' "$TMP/SHA256SUMS" | head -1)"
+    [[ -n "$want" ]] || die "SHA256SUMS does not mention $TARBALL — refusing to unpack it"
+    got="$(SHA "$TMP/$TARBALL")"
+    if [[ "$want" != "$got" ]]; then
+        echo "  expected $want" >&2; echo "  got      $got" >&2
+        die "checksum MISMATCH — not unpacking. Do not retry blindly; ask the operator."
+    fi
+    say "verified $TARBALL against SHA256SUMS (sha256 ${got:0:16}…)"
+    say "NOTE: a checksum served from the same place as the file proves the download was"
+    say "      not corrupted. It does not prove it came from us — release signing is not"
+    say "      established yet. Read the files before you trust them."
+
+    tar xzf "$TMP/$TARBALL" -C "$TMP" || die "could not unpack $TARBALL"
+    SRC="$(find "$TMP" -maxdepth 2 -name tee-claude -type f -print -quit)"
+    SRC="${SRC%/tee-claude}"
+    [[ -n "$SRC" && -d "$SRC" ]] || die "unpacked tarball does not contain tee-claude"
+fi
+
+for f in "${NEED[@]}"; do
     [[ -f "$SRC/$f" ]] || die "$f is missing from $SRC — is this a complete checkout?"
 done
 
@@ -88,13 +144,7 @@ cat <<EOF
 
 Next steps
 ──────────
-1. Put your session credential where the launcher can find it:
-
-       umask 077 && printf '%s' 'YOUR-KEY-HERE' > $CFG_DIR/token
-
-   (or export ANTHROPIC_AUTH_TOKEN in your shell instead)
-
-2. Pin the endpoint's TLS key in $CFG_DIR/policy.json.
+1. Pin the endpoint's TLS key in $CFG_DIR/policy.json.
    The shipped policy has "tls_spki_sha256": "REPLACE-ME", which makes
    check [10] FAIL and the launcher refuse to start. That is deliberate.
    Take the value from the operator's published release notes. You can see
@@ -104,11 +154,13 @@ Next steps
 
    and compare it with the published value before you paste it in.
 
-3. Dry-run the verifier without starting a session, and read every line:
+2. Dry-run the verifier without starting a session, and read every line:
 
        tee-claude --verify-only
 
-4. Start a session:
+3. Start a session. It will ask for your session key the first time and
+   offer to remember it; nothing is typed on a command line, so nothing
+   lands in your shell history:
 
        tee-claude
 
