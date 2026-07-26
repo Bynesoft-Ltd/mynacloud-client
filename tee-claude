@@ -87,7 +87,7 @@ Environment:
   TEE_CLAUDE_STRICT_MCP=1 load ONLY our MCP server, not the ones you have configured
   TEE_CLAUDE_PORT=NNNN    skip DNS port discovery and use this port (the hostname
                           stays pinned by your policy either way)
-  ANTHROPIC_AUTH_TOKEN    your session credential (or put it in ~/.tee-claude/token)
+  ANTHROPIC_AUTH_TOKEN    your session credential. If unset and no ~/.tee-claude/token\n                          exists, you are asked for it at startup (never echoed,\n                          never in shell history)
 
 There is deliberately no flag that converts a FAILED check into a pass.
 USAGE
@@ -697,8 +697,52 @@ if [[ -z "$TOKEN" && -f "$CONFIG_DIR/token" ]]; then
     fi
     TOKEN="$(tr -d '[:space:]' < "$CONFIG_DIR/token")"
 fi
+# Nothing found yet, and someone is sitting at a terminal: ASK. The instruction this
+# replaces was
+#
+#     umask 077 && printf '%s' 'YOUR-KEY-HERE' > ~/.tee-claude/token
+#
+# which is worse than a prompt for a reason that is easy to miss: `printf ... 'KEY'`
+# goes into the shell's history file. On a default bash or zsh the credential ends up in
+# ~/.bash_history or ~/.zsh_history in cleartext, surviving the session, and nothing in
+# that one-liner hints at it. A read with echo off never touches history at all.
+#
+# Read from /dev/tty, not stdin: stdin may be a pipe (`tee-claude -p ... < file`) and a
+# credential must never be consumed from the same stream as data.
+if [[ -z "$TOKEN" ]] && [[ -r /dev/tty ]] && [[ -t 1 ]]; then
+    printf '  No credential found in $ANTHROPIC_AUTH_TOKEN or %s.\n' "$CONFIG_DIR/token"
+    printf '  Paste your session key (not shown as you type), or press Enter to abort: '
+    IFS= read -rs TOKEN < /dev/tty || TOKEN=""
+    printf '\n'
+    TOKEN="$(printf '%s' "$TOKEN" | tr -d '[:space:]')"
+    if [[ -n "$TOKEN" && "$TOKEN" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
+        # Offer to persist it, because otherwise this prompt is a worse UX than the file
+        # it replaced: once per session forever. Default is NO — writing a credential to
+        # disk is the user's call, not a default.
+        printf '  Save it to %s so you are not asked again? [y/N] ' "$CONFIG_DIR/token"
+        IFS= read -r _save < /dev/tty || _save=n
+        if [[ "$_save" =~ ^[Yy] ]]; then
+            mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR" 2>/dev/null || true
+            # Create it empty at 600 FIRST, then write. Redirecting straight into a new
+            # file would briefly leave it at the umask's mode with the key already in it.
+            : > "$CONFIG_DIR/token"; chmod 600 "$CONFIG_DIR/token" 2>/dev/null || true
+            printf '%s' "$TOKEN" > "$CONFIG_DIR/token"
+            printf '  saved (mode 600). Delete that file to be asked again.\n'
+        fi
+        TOKEN_SOURCE="entered at the prompt"
+    elif [[ -n "$TOKEN" ]]; then
+        : # falls through to the alphabet check below, which refuses it
+    fi
+fi
+
 if [[ -z "$TOKEN" ]]; then
-    fail 13 "No credential — set ANTHROPIC_AUTH_TOKEN or write $CONFIG_DIR/token"
+    if [[ -r /dev/tty ]] && [[ -t 1 ]]; then
+        fail 13 "No credential given"
+    else
+        # Non-interactive: no tty to prompt on, so say what to do instead of prompting
+        # into the void. This is the CI / `| tee-claude` path.
+        fail 13 "No credential and no terminal to ask on — set ANTHROPIC_AUTH_TOKEN or write $CONFIG_DIR/token"
+    fi
 elif [[ ! "$TOKEN" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
     # The credential is handed to curl through a config file on stdin, whose
     # quoting we must not be able to break out of. Real keys are in this
@@ -707,7 +751,7 @@ elif [[ ! "$TOKEN" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
     fail 13 "Credential contains characters outside the expected key alphabet — refusing to use it"
     TOKEN=""
 else
-    ver 13 "Session credential present (${#TOKEN} chars; never printed, never on a command line)"
+    ver 13 "Session credential present (${#TOKEN} chars, ${TOKEN_SOURCE:-from environment or token file}; never printed, never on a command line)"
 fi
 
 # =============================================================================
