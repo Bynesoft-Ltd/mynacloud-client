@@ -30,11 +30,17 @@ set -uo pipefail
 VERSION="0.2.0-alpha"
 UPDATE_REPO="Bynesoft-Ltd/mynacloud-client"
 
-# Ed25519 public key (PEM, single line, base64 body) used by `--update` to verify
-# the release SHA256SUMS. EMPTY IN THIS BUILD: release signing is not yet
-# established, and `--update` therefore REFUSES to replace this file. It will
-# still check for a newer release, verify its SHA-256 and print what changed —
-# it just will not write. See docs in README.md ("Updating").
+# Ed25519 public key used by `--update` to verify the release SHA256SUMS.
+# Paste it EXACTLY as `openssl pkey -in release.key -pubout` prints it, BEGIN
+# and END lines included, e.g.
+#     UPDATE_PUBKEY_PEM='-----BEGIN PUBLIC KEY-----
+#     MCowBQYDK2VwAyEA...=
+#     -----END PUBLIC KEY-----'
+#
+# EMPTY IN THIS BUILD: release signing is not yet established, so `--update`
+# REFUSES to replace this file. It still checks for a newer release, verifies
+# its SHA-256 and prints what changed — it just will not write. README.md
+# ("Updating") says the same thing to the customer.
 UPDATE_PUBKEY_PEM=""
 
 # ---- locate ourselves, through symlinks (the installer symlinks into ~/.local/bin)
