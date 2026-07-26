@@ -42,10 +42,10 @@ before unpacking, and installs into your home directory. No root, nothing outsid
 > thing that ran were two different fetches. Same reason `--update` won't install itself — see
 > [Updating](#updating).
 
-Two more steps, both explained by the installer when it finishes:
+Then:
 
-1. **Pin the endpoint's key** in `~/.tee-claude/policy.json` → [Pinning](#pinning-the-endpoints-key)
-2. **Start a session.** It asks for your session key the first time and offers to remember it.
+**Start a session.** It asks for your session key the first time and offers to remember it. The
+endpoint's TLS key is [already pinned](#the-endpoints-key-is-already-pinned) for you.
 
 ```sh
 tee-claude --verify-only            # run every check that needs no credential, then stop
@@ -65,24 +65,35 @@ tee-claude -p "explain this repo"   # extra arguments pass through to claude
 
 ---
 
-## Pinning the endpoint's key
+## The endpoint's key is already pinned
 
-The shipped policy has `"tls_spki_sha256": "REPLACE-ME"`, which makes check `[10]` **FAIL** and
-the launcher refuse to start. That is deliberate: an unpinned key means the only thing between
-you and any certificate the public CA system will issue for this name is the public CA system.
+`policy.example.json` ships with `tls_spki_sha256` **filled in**, so a fresh install has a
+working pin and check `[10]` passes. You do not have to hunt for a value.
 
-Take the value from the operator's published release notes. To see what the endpoint is
-currently presenting:
+That pin reached you inside this repository — release tarball, checksum-verified against the
+release's `SHA256SUMS` before anything was unpacked. That is a **different root of trust** from
+the certificate `api.mynacloud.com` presents, which is the whole point: at check `[10]` two
+independent sources have to agree.
+
+It is not trust-on-first-use. TOFU would be pinning whatever the endpoint happens to present on
+your first connection, with nothing to compare against. Nothing here does that, and no flag will.
+
+You can check it yourself, and you are encouraged to:
 
 ```sh
-tee-claude --print-spki
+tee-claude --print-spki      # what the endpoint is presenting right now
 ```
 
-**Compare the two before you paste anything into your policy.** Pinning whatever you happen to
-see, without comparing against an independently published value, is trust-on-first-use and is
-much weaker.
+It should equal the value in your `~/.tee-claude/policy.json`.
 
----
+> **If it does not match, do not edit your policy to make the error go away.** A mismatch is one
+> of exactly two things: a key rotation you were not told about, or someone presenting a
+> certificate that is not ours. Ask which — overwriting the pin with whatever the endpoint showed
+> you converts a caught problem into an uncaught one.
+
+Emptying the field, or setting it back to `REPLACE-ME`, makes `[10]` **FAIL** and the launcher
+refuse to start. That is deliberate: an unpinned key leaves the public CA system as the only
+thing between you and any certificate issued for this name.
 
 ## Your policy file
 
