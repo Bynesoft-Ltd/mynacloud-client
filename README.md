@@ -27,22 +27,29 @@ You need `bash`, `python3`, `curl`, `openssl`, one of `dig`/`host`/`nslookup`, a
 npm install -g @anthropic-ai/claude-code
 ```
 
-Then download the installer, **read it**, and run it:
+Then:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Bynesoft-Ltd/mynacloud-client/main/install.sh | bash
+```
+
+It resolves the latest release, **verifies the tarball's SHA-256 against the release's
+`SHA256SUMS` before unpacking anything**, and installs into your home directory. No root,
+nothing outside `$HOME`.
+
+If you would rather read it first — it is short, and reading what you are about to run is
+never a bad instinct:
 
 ```sh
 curl -fLO https://raw.githubusercontent.com/Bynesoft-Ltd/mynacloud-client/main/install.sh
-less install.sh
-bash install.sh
+less install.sh && bash install.sh
 ```
 
-It fetches the latest release tarball, verifies its SHA-256 against the release's `SHA256SUMS`
-before unpacking, and installs into your home directory. No root, nothing outside `$HOME`.
-
-> Deliberately **not** `curl … | bash`. Piping into a shell means the thing you audited and the
-> thing that ran were two different fetches. Same reason `--update` won't install itself — see
-> [Updating](#updating).
-
-Then:
+> The installer's body is wrapped in a function that is only invoked on its last line, so a
+> connection that drops mid-transfer installs **nothing** rather than half of something.
+> What piping cannot give you is provenance: the checksum proves the download was not
+> corrupted, not that it came from us. Release signing is not established yet — the same
+> reason [`--update`](#updating) still refuses to install itself.
 
 **Start a session.** It asks for your session key the first time and offers to remember it. The
 endpoint's TLS key is [already pinned](#the-endpoints-key-is-already-pinned) for you.

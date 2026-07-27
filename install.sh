@@ -18,7 +18,14 @@
 # =============================================================================
 set -euo pipefail
 
-SRC="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Piped (curl | bash) there IS no script file: BASH_SOURCE is unset, and under `set -u`
+# this line aborted the installer before it printed anything. Empty SRC means "no files
+# beside me", which is exactly right — it takes the verified-download path below.
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ "${BASH_SOURCE[0]}" != "bash" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    SRC="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+else
+    SRC=""
+fi
 HOME_DIR="${TEE_CLAUDE_HOME:-$HOME/.local/share/mynacloud-client}"
 BIN_DIR="${TEE_CLAUDE_BINDIR:-$HOME/.local/bin}"
 CFG_DIR="${TEE_CLAUDE_CONFIG_DIR:-$HOME/.tee-claude}"
@@ -27,6 +34,14 @@ say()  { printf '  %s\n' "$*"; }
 warn() { printf '  ! %s\n' "$*" >&2; }
 die()  { printf '  FATAL: %s\n' "$*" >&2; exit 1; }
 
+# EVERYTHING BELOW RUNS ONLY IF THE WHOLE FILE ARRIVED.
+#
+# `curl | bash` feeds the shell a stream: if the connection drops mid-transfer, bash
+# executes the truncated prefix — a half-finished install with no error. Wrapping the body
+# in a function and calling it on the very last line makes a partial download a no-op,
+# because the call is the last thing to arrive. This is the one real hazard of piping that
+# is not a matter of trust, and it costs two lines.
+main() {
 echo
 echo "Installing the mynacloud client"
 echo
@@ -188,3 +203,7 @@ if (( POLICY_IS_NEW )); then
     echo "  Your policy is at $CFG_DIR/policy.json — it is yours; read it."
     echo
 fi
+
+}
+
+main "$@"
