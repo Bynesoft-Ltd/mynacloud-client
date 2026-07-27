@@ -59,10 +59,40 @@ if ((${#missing[@]})); then
     echo "  Missing required tools: ${missing[*]}"
     echo
     echo "    Debian/Ubuntu:  sudo apt install python3 curl openssl dnsutils"
-    echo "    macOS:          these ship with the system; 'dig' comes with"
-    echo "                    bind (brew install bind) if it is absent"
+    echo "    macOS:          'dig' comes with bind (brew install bind)"
     die "install the tools above and re-run this script"
 fi
+
+# An `openssl` that EXISTS is not an openssl that WORKS. macOS ships LibreSSL as
+# /usr/bin/openssl: no -verify_hostname, no -rawin, no Ed25519. Catch that here,
+# at install time, instead of letting the customer discover it as five red
+# FAILED lines about TLS on their first run. tee-claude searches the standard
+# Homebrew/MacPorts locations itself, so mirror that search rather than trusting
+# whatever `openssl` happens to resolve to.
+_ssl_ok=""
+for _c in "${TEE_CLAUDE_OPENSSL:-}" "$(command -v openssl 2>/dev/null)" \
+          /opt/homebrew/bin/openssl /opt/homebrew/opt/openssl@3/bin/openssl \
+          /usr/local/bin/openssl /usr/local/opt/openssl@3/bin/openssl \
+          /opt/local/bin/openssl; do
+    [ -n "$_c" ] && [ -x "$_c" ] || continue
+    if "$_c" s_client -help 2>&1 | grep -q -- '-verify_hostname' \
+    && "$_c" pkeyutl  -help 2>&1 | grep -q -- '-rawin'; then
+        _ssl_ok="$_c"; break
+    fi
+done
+if [ -z "$_ssl_ok" ]; then
+    echo "  No usable OpenSSL found."
+    echo
+    echo "  tee-claude needs 'openssl s_client -verify_hostname' to verify the endpoint"
+    echo "  and 'openssl pkeyutl -rawin' to verify signed releases. macOS ships LibreSSL"
+    echo "  as /usr/bin/openssl, which has neither and does not implement Ed25519."
+    echo
+    echo "      brew install openssl@3"
+    echo
+    echo "  You do not need to change your PATH afterwards — tee-claude finds it."
+    die "install OpenSSL 3.x and re-run this script"
+fi
+say "using openssl: $_ssl_ok"
 
 if ! command -v claude >/dev/null 2>&1; then
     warn "'claude' is not on your PATH. tee-claude verifies the endpoint and then"
