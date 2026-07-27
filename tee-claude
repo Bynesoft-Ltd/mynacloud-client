@@ -27,7 +27,7 @@
 # =============================================================================
 set -uo pipefail
 
-VERSION="0.2.3-alpha"
+VERSION="0.2.4-alpha"
 UPDATE_REPO="Bynesoft-Ltd/mynacloud-client"
 
 # Ed25519 public key used by `--update` to verify the release SHA256SUMS.
