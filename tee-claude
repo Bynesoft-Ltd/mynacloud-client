@@ -27,7 +27,7 @@
 # =============================================================================
 set -uo pipefail
 
-VERSION="0.2.6-alpha"
+VERSION="0.2.7-alpha"
 UPDATE_REPO="Bynesoft-Ltd/mynacloud-client"
 
 # Ed25519 public key used by `--update` to verify the release SHA256SUMS.
@@ -905,6 +905,45 @@ else
     ver 13 "Session credential present (${#TOKEN} chars, ${TOKEN_SOURCE:-from environment or token file}; never printed, never on a command line)"
 fi
 
+# Prompt for a REPLACEMENT credential on the tty. Used by check [37] when the
+# endpoint rejects the one we have.
+#
+# This is not an override and does not turn a FAILED into a pass: it supplies
+# DIFFERENT INPUT and re-runs the same check, which either passes on its own
+# merits or does not. The distinction matters — a rejected credential is one of
+# the very few failures here the user can legitimately fix on the spot, and
+# exiting to a shell so they can `rm ~/.tee-claude/token` and start over teaches
+# nothing and helps no one.
+#
+# Sets TOKEN and returns 0 on success; leaves TOKEN untouched and returns 1 if
+# the user declines or types something that is not a key.
+reprompt_token() {
+    local _t _save
+    [[ -r /dev/tty && -t 1 ]] || return 1
+    printf '  Paste a different session key (not shown as you type), or press Enter to give up: '
+    IFS= read -rs _t < /dev/tty || _t=""
+    printf '\n'
+    _t="$(printf '%s' "$_t" | tr -d '[:space:]')"
+    [[ -n "$_t" ]] || return 1
+    # Same alphabet gate as the first prompt: the token reaches curl through a
+    # config file whose quoting must not be breakable.
+    if [[ ! "$_t" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
+        printf '  That contains characters outside the expected key alphabet — not using it.\n'
+        return 1
+    fi
+    TOKEN="$_t"
+    TOKEN_SOURCE="re-entered after the endpoint rejected the previous one"
+    printf '  Save it to %s, replacing what is there? [y/N] ' "$CONFIG_DIR/token"
+    IFS= read -r _save < /dev/tty || _save=n
+    if [[ "$_save" =~ ^[Yy] ]]; then
+        mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR" 2>/dev/null || true
+        : > "$CONFIG_DIR/token"; chmod 600 "$CONFIG_DIR/token" 2>/dev/null || true
+        printf '%s' "$TOKEN" > "$CONFIG_DIR/token"
+        printf '  saved (mode 600).\n'
+    fi
+    return 0
+}
+
 # =============================================================================
 # 4. TEE-rooted claims — unprovable without a Confidential VM + CC GPU
 # =============================================================================
@@ -1116,6 +1155,30 @@ echo "Contacting the endpoint (first use of your credential):"
 acurl() { printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -sS -K - "$@"; }
 
 probe="$(acurl -m 25 -o /dev/null -w '%{http_code}' "$ENDPOINT/v1/models" 2>/dev/null)"
+
+# A rejected credential used to end the run: five words, exit, work out the rest
+# yourself. It is the one failure in this list with an obvious in-session remedy,
+# so offer it — up to three attempts, on a terminal only, never in CI.
+_auth_tries=0
+_auth_swapped=0
+while [[ "$probe" == "401" || "$probe" == "403" ]]; do
+    [[ -r /dev/tty && -t 1 ]] || break          # CI / piped: do not prompt into the void
+    (( _auth_tries >= 3 )) && break             # bounded: this is not a password oracle
+    printf '\n  The endpoint rejected that credential (HTTP %s).\n' "$probe"
+    if (( _auth_tries == 0 )); then
+        printf '  Usual causes: the key was revoked or rotated, it expired (keys are issued\n'
+        printf '  for 90 days), or its budget window is exhausted. The endpoint itself is\n'
+        printf '  reachable and its certificate already verified above, so this is about the\n'
+        printf '  key, not the connection.\n'
+    fi
+    reprompt_token || break
+    _auth_tries=$((_auth_tries+1)); _auth_swapped=1
+    probe="$(acurl -m 25 -o /dev/null -w '%{http_code}' "$ENDPOINT/v1/models" 2>/dev/null)"
+done
+if (( _auth_swapped )) && [[ "$probe" == "200" ]]; then
+    info 13 "Credential replaced during this run (attempt $((_auth_tries+1))); [13] above described the one that was rejected"
+fi
+
 SRV_MODEL=""; SRV_NAME=""; SRV_DESC=""; SRV_CTX=""; SRV_OUT=""
 case "$probe" in
   200)
@@ -1132,7 +1195,7 @@ case "$probe" in
             fail 37 "Endpoint authenticated but advertised no model"
         fi
     fi ;;
-  401|403) fail 37 "Endpoint rejected the credential (HTTP $probe)" ;;
+  401|403) fail 37 "Endpoint rejected the credential (HTTP $probe)$( ((_auth_tries)) && printf " — %s replacement(s) also rejected" "$_auth_tries")" ;;
   000|"")  fail 37 "Endpoint did not respond — it is very likely powered off (see the nightly-outage note above)" ;;
   *)       fail 37 "Endpoint probe failed (HTTP $probe)" ;;
 esac
