@@ -59,8 +59,8 @@ tee-claude -p "explain this repo"   # extra arguments pass through to claude
 
 | | |
 |---|---|
-| **It is off every night.** | Powered down nightly, ~20 min to reload after power-on. Its IP *and* port change on each restart. If a check fails, the machine being off is the likeliest reason. → [detail](#the-nightly-outage) |
-| **It cannot see images or PDFs**, and left alone it invents answers about them. | The launcher blocks what it can, but **cannot** block an image you paste into the prompt box. → [detail](#images-and-pdfs) |
+| **It stops at 20:00 Europe/Kyiv, every day.** | ~21 min to reload after it is started again the next morning, and its IP *and* port change every restart. If a check fails, the machine being off is the likeliest reason. → [detail](#the-nightly-outage) |
+| **It cannot see images or PDFs.** | Almost every path fails *loudly*. One path — an image file read from disk — would silently invent a description, and the bundled hook blocks exactly that. → [detail](#images-and-pdfs) |
 | **Privacy here is configuration, not proof.** | Prompts aren't logged, but that is how the endpoint is configured — not something cryptography enforces. → [detail](#what-privacy-does-and-does-not-mean) |
 | **`/cost` overstates your spend by about 36×.** | Claude Code prices this model as if it were Anthropic's most expensive tier. The endpoint's own figure is the one you are billed on. → [detail](#cost-is-not-what-you-are-billed) |
 
@@ -115,43 +115,44 @@ to a different host.
 
 ## Images and PDFs
 
-This is not "attachments don't work". It is worse: PDFs are dropped in transit and images
-arrive as base64 text the model cannot interpret, so it answers **confidently and wrongly**
-about a file it never received. Asked for a token inside a test PDF, it invented a
-plausible-looking one and put it in a code block as if quoting the document.
+The model is text-only. Measured, per path:
 
-The launcher installs a hook that blocks the paths it can see:
-
-| path | blocked? |
+| what you do | what happens |
 |---|---|
-| `Read` / `NotebookRead` of an image or PDF | yes |
-| `cat`, `head`, `base64`, `xxd`, `dd if=` … in a `Bash` command | yes |
-| filesystem MCP servers' own read tools | yes |
-| `@`-mentioning an image or PDF in your prompt | yes |
-| **an image you paste or drag into the prompt box** | **no** |
+| attach or paste an image | **clean 400** — loud, you cannot miss it |
+| attach a PDF | **clean 400** — loud |
+| `Read` a PDF from disk | **clean 400** — loud |
+| **`Read` an image file from disk** | **200, and the model invents a description** |
 
-A pasted image becomes an attachment at submit time. It is not a tool call, so a `PreToolUse`
-hook never sees it; it is not prompt text, so a `UserPromptSubmit` hook cannot either. There is
-no client-side interception point, so we do not claim one.
+Only that last row is dangerous, and it is the one the bundled
+`no-attachment-hook.py` exists to stop — it refuses `Read`/`NotebookRead` of an image, and
+also `cat`, `head`, `base64`, `xxd`, `dd if=` in a `Bash` command, filesystem MCP read
+tools, and `@`-mentions of an image. Verified: the hook denies a `Read` of a PNG.
 
-**If you paste a screenshot, the description you get back is invented.** Convert to text first
-— `pdftotext` for a PDF, describe an image in words. SVG is fine: it is text, and the model
-reads it well.
+So the hook is **load-bearing, not belt-and-braces.** If you disable it, an image file read
+from disk comes back as a confident description of something the model never saw. Asked for
+a token inside a test PDF, it invented a plausible-looking one and put it in a code block as
+if quoting the document.
 
----
+Convert to text first — `pdftotext` for a PDF, describe an image in words. SVG is fine: it
+is text, and the model reads it well.
 
 ## The nightly outage
 
-The machine is powered down each night and restarted the next day. That is a hard outage with
-no drain: an in-flight response truncates mid-stream, your session stops, and the endpoint
-refuses connections until the model has finished loading — currently on the order of twenty
-minutes after power-on.
+**The service stops at 20:00 Europe/Kyiv, seven days a week** (17:00 UTC in summer, 18:00
+UTC in winter — it follows Kyiv local time, not a fixed UTC hour). It is started again in
+the morning **by hand**, so there is no guaranteed opening time.
 
-Its public IP address *and* its TCP port both change on every restart, which is why the
-launcher looks the port up in DNS every time it starts. **Do not plan work around this endpoint
-being reachable.**
+The shutdown gives in-flight work **180 seconds to finish** and takes a final database
+snapshot before stopping, so a request already running will usually complete. A request
+that outlives the drain is cut mid-stream.
 
----
+Coming back takes **~21 minutes** — the model is a 148 GiB checkpoint and the endpoint
+refuses connections until it has loaded. Its public IP *and* TCP port both change on every
+restart, which is why the launcher re-reads the DNS TXT record at every start.
+
+**Do not plan work around this endpoint being reachable**, and do not start a long task at
+19:45 Kyiv.
 
 ## What privacy does and does not mean
 
