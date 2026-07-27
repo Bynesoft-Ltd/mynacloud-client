@@ -21,7 +21,22 @@ non-interactive consent variable.
 
 ## Quickstart
 
-You need `bash`, `python3`, `curl`, `openssl`, one of `dig`/`host`/`nslookup`, and Claude Code:
+You need `bash`, `python3`, `curl`, **OpenSSL 3.x**, one of `dig`/`host`/`nslookup`, and Claude Code.
+
+> **macOS: the built-in `openssl` is not enough.** `/usr/bin/openssl` is LibreSSL, which cannot
+> verify a hostname (`-verify_hostname`), cannot verify an Ed25519 release signature
+> (`-rawin`), and does not implement Ed25519 at all. `tee-claude` will not pretend otherwise —
+> it fails the affected checks by name rather than skipping them. Install a real one:
+>
+> ```sh
+> brew install openssl@3
+> ```
+>
+> You do **not** need to change your `PATH`: `tee-claude` looks for a capable OpenSSL at the
+> standard Homebrew and MacPorts locations and uses it regardless of what `openssl` resolves to.
+> To point it somewhere else, set `TEE_CLAUDE_OPENSSL=/path/to/openssl`.
+
+Then Claude Code itself:
 
 ```sh
 npm install -g @anthropic-ai/claude-code
@@ -263,18 +278,42 @@ and would quietly weaken exactly those guarantees, so it is not recommended.
 tee-claude --update
 ```
 
-**Release signing is not established yet, so this command will not replace itself.** It fetches
-the release metadata, prints the notes, downloads the tarball and `SHA256SUMS`, verifies the
-tarball's SHA-256 — then **stops** and tells you where the verified download is, so you can
-inspect and install it yourself.
+This fetches the release metadata, prints the notes, downloads the tarball and `SHA256SUMS`,
+checks the tarball's SHA-256, **verifies an Ed25519 signature over `SHA256SUMS` against the
+publisher key pinned inside `tee-claude`**, shows you which files would change, and asks you to
+type `yes` before writing anything. Files are replaced by write-to-temp-then-rename, so an
+interrupted update never leaves half a file.
 
-Why it stops: a checksum published next to the file it describes proves the download was not
-corrupted. It does not prove it came from us. A self-updater acting on that is a direct write
-path into every user's laptop — a bigger hole than anything this launcher checks for.
+If the signature is missing or does not verify, the update is refused. There is no flag that
+turns that off.
 
-When a publisher key is pinned and releases are signed, the same command will verify that
-signature (Ed25519 over `SHA256SUMS`) and install atomically. Until then, updating is a
-deliberate act you perform.
+**Why the signature and not just the checksum.** The checksum is fetched over TLS from a
+hardcoded repository path, so it is a GitHub-authenticated statement that this tarball is that
+release's asset. That already defeats a network attacker, a poisoned CDN edge and a truncated
+download. What it does *not* survive is compromise of the publishing account: a stolen token
+could replace the tarball and the `SHA256SUMS` beside it in one act, because both live in the
+same place under the same credential. The signing key is held offline, so write access to the
+repository is not enough to forge a release this launcher will install. That single gap is what
+the signature closes, and it is worth closing precisely because `--update` is a write path into
+your machine.
+
+You can check the pinned key against the fingerprint published in the release notes:
+
+```sh
+grep -A2 "BEGIN PUBLIC KEY" "$(command -v tee-claude)" | sed "s/^UPDATE_PUBKEY_PEM='//" \
+  | openssl pkey -pubin -pubout | shasum -a 256
+```
+
+### Coming from 0.2.5-alpha or earlier
+
+Those builds pin no publisher key, so their `--update` cannot verify one and will refuse to
+write. Reinstall once to get onto the signed track:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Bynesoft-Ltd/mynacloud-client/main/install.sh | bash
+```
+
+Every update after that is a single `tee-claude --update`.
 
 ---
 
@@ -288,6 +327,7 @@ deliberate act you perform.
 | `TEE_CLAUDE_SEARCH=off` | disable the client-side web-search server |
 | `TEE_CLAUDE_STRICT_MCP=1` | load only our MCP server, not the ones you have configured |
 | `TEE_CLAUDE_PORT=NNNN` | skip DNS discovery, use this port (hostname stays pinned) |
+| `TEE_CLAUDE_OPENSSL` | use this openssl instead of the autodetected one (see macOS note above) |
 
 There is deliberately **no** variable that skips a check, consents on your behalf, or turns a
 `FAILED` into a pass.

@@ -27,7 +27,7 @@
 # =============================================================================
 set -uo pipefail
 
-VERSION="0.2.5-alpha"
+VERSION="0.2.6-alpha"
 UPDATE_REPO="Bynesoft-Ltd/mynacloud-client"
 
 # Ed25519 public key used by `--update` to verify the release SHA256SUMS.
@@ -37,11 +37,21 @@ UPDATE_REPO="Bynesoft-Ltd/mynacloud-client"
 #     MCowBQYDK2VwAyEA...=
 #     -----END PUBLIC KEY-----'
 #
-# EMPTY IN THIS BUILD: release signing is not yet established, so `--update`
-# REFUSES to replace this file. It still checks for a newer release, verifies
-# its SHA-256 and prints what changed — it just will not write. README.md
-# ("Updating") says the same thing to the customer.
-UPDATE_PUBKEY_PEM=""
+# This is the publisher key for Bynesoft-Ltd/mynacloud-client. `--update`
+# verifies SHA256SUMS against it and REFUSES to write anything if the signature
+# is missing or bad. There is no flag that turns that off.
+#
+# Its private half is held offline and is not on the inference host, so write
+# access to the GitHub repository is NOT sufficient to forge a release this
+# launcher will install. That is the whole and only point of it.
+#
+# Fingerprint, so it can be checked against the value published in the release
+# notes without trusting this file:
+#     openssl pkey -pubin -in <(…) -pubout | sha256sum
+#     c5e23c4331666ac33c8020e1c7d3c91c0674336a20eaa8f5740adcc2650dc65e
+UPDATE_PUBKEY_PEM='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEADLPJNdv6OJUzzWPKtgmIkuH1QdzFQIXBZVqsA8jdbIY=
+-----END PUBLIC KEY-----'
 
 # ---- locate ourselves, through symlinks (the installer symlinks into ~/.local/bin)
 _self="${BASH_SOURCE[0]}"
@@ -170,6 +180,64 @@ run_bounded() {
     [ "$_rc" -eq 143 ] && _rc=124
     return "$_rc"
 }
+
+# ---- choosing an openssl that can actually do the job ----------------------
+# macOS ships LibreSSL as /usr/bin/openssl. Measured on macOS, LibreSSL 3.3.6:
+#
+#     openssl s_client -help | grep -c -- -verify_hostname   ->  0
+#     openssl pkeyutl  -help | grep -c -- -rawin             ->  0
+#     openssl genpkey -algorithm ed25519                     ->  "not found"
+#
+# So the system openssl cannot verify a hostname, cannot verify an Ed25519
+# release signature, and does not know the algorithm exists. `x509 -ext` is
+# missing too, which check [11] needs. A Mac with Homebrew has a capable
+# OpenSSL 3.x, but only if it happens to come first on PATH — and whether it
+# does is an accident of shell configuration, not something a customer should
+# have to reason about.
+#
+# So: find a capable binary rather than trusting the name `openssl`. Every call
+# site below uses "$OPENSSL", never a bare `openssl`.
+OPENSSL=""            # the binary chosen; "" if nothing usable was found
+OPENSSL_HAS_VHOST=0   # s_client -verify_hostname : required for check [08]
+OPENSSL_HAS_RAWIN=0   # pkeyutl -rawin            : required for --update
+
+pick_openssl() {
+    local cands=() c vh ri best_vh=""
+    # An explicit override wins, so a user with a non-standard install is never
+    # stuck arguing with this list.
+    [[ -n "${TEE_CLAUDE_OPENSSL:-}" ]] && cands+=("$TEE_CLAUDE_OPENSSL")
+    c="$(command -v openssl 2>/dev/null)"; [[ -n "$c" ]] && cands+=("$c")
+    # Standard Homebrew (arm64 and Intel), MacPorts, then the system one last —
+    # it is the least capable, but naming it in an error beats "not found".
+    cands+=(/opt/homebrew/bin/openssl /opt/homebrew/opt/openssl@3/bin/openssl \
+            /usr/local/bin/openssl   /usr/local/opt/openssl@3/bin/openssl \
+            /opt/local/bin/openssl   /usr/bin/openssl)
+
+    for c in "${cands[@]}"; do
+        [[ -x "$c" ]] || continue
+        vh=0; ri=0
+        "$c" s_client -help 2>&1 | grep -q -- '-verify_hostname' && vh=1
+        "$c" pkeyutl  -help 2>&1 | grep -q -- '-rawin'           && ri=1
+        if [[ "$vh" -eq 1 && "$ri" -eq 1 ]]; then
+            OPENSSL="$c"; OPENSSL_HAS_VHOST=1; OPENSSL_HAS_RAWIN=1; return 0
+        fi
+        # Remember a partially-capable one, but keep looking for a better.
+        [[ "$vh" -eq 1 && -z "$best_vh" ]] && best_vh="$c"
+    done
+
+    if [[ -n "$best_vh" ]]; then
+        OPENSSL="$best_vh"; OPENSSL_HAS_VHOST=1; OPENSSL_HAS_RAWIN=0; return 0
+    fi
+    for c in "${cands[@]}"; do [[ -x "$c" ]] && { OPENSSL="$c"; break; }; done
+    return 1
+}
+
+OPENSSL_ADVICE="macOS ships LibreSSL as /usr/bin/openssl, which cannot do this.
+  Install OpenSSL 3:   brew install openssl@3
+  tee-claude then finds it automatically — you do NOT need to change your PATH.
+  Or name one explicitly:  TEE_CLAUDE_OPENSSL=/path/to/openssl tee-claude"
+
+pick_openssl || true
 
 # ---- helper programs -------------------------------------------------------
 # Held in variables and handed to `python3 -c` because these ones read their
@@ -395,38 +463,33 @@ PY
     echo "  [ok]   SHA-256 of the download matches the release's SHA256SUMS"
     echo "         $got"
 
+    # WHAT THE CHECKSUM ABOVE IS AND IS NOT WORTH.
+    #
+    # It was fetched over TLS from a hardcoded repository path, so it is a
+    # GitHub-authenticated assertion that this tarball is that release's asset.
+    # That defeats a network attacker, a poisoned CDN edge and a truncated
+    # download. It does NOT survive compromise of the publishing account: a
+    # stolen token can replace the tarball and the SHA256SUMS beside it in the
+    # same act, because both live in the same place under the same credential.
+    #
+    # The signature below is what closes that gap, and only that gap. Its key
+    # is held offline, so repository write access is not enough to forge it.
     if [[ -z "$UPDATE_PUBKEY_PEM" ]]; then
-        cat <<EOF
-
-  [STOP] Release signing is NOT yet established for this project, so this build
-         has no publisher key pinned in it and CANNOT verify who produced that
-         SHA256SUMS file. A checksum published next to the file it describes
-         proves the download was not corrupted; it does NOT prove it came from
-         us. Replacing a program on your machine on that basis would be a worse
-         hole than anything this launcher checks for, so tee-claude will not
-         do it.
-
-  The download whose SHA-256 was checked above has been left for you at:
-         $tmp/pkg.tar.gz
-
-  To install $TAG deliberately, after deciding you trust it:
-         cd $tmp
-         tar -tzf pkg.tar.gz          # look at what is in it first
-         tar -xzf pkg.tar.gz && ./mynacloud-client-*/install.sh
-
-  Then delete $tmp.
-
-EOF
-        trap - EXIT
-        exit 3
+        die "this build pins no publisher key, so it cannot verify who produced
+  release $TAG. That is a defect in this build, not a problem with the release.
+  Reinstall from https://github.com/$UPDATE_REPO to get a build that can."
     fi
 
-    # --- signed path (inert until UPDATE_PUBKEY_PEM is filled in) -------------
-    need openssl
-    [[ "$SIG_URL" == "-" ]] && die "release $TAG is not signed but this build requires a signature"
+    # --- signature: required, no override ------------------------------------
+    if [[ "$OPENSSL_HAS_RAWIN" -ne 1 ]]; then
+        die "cannot verify the release signature: ${OPENSSL:-no openssl found} lacks
+  'pkeyutl -rawin', so it cannot check an Ed25519 signature.
+  $OPENSSL_ADVICE"
+    fi
+    [[ "$SIG_URL" == "-" ]] && die "release $TAG carries no SHA256SUMS.sig, and this build requires one. Refusing."
     curl -fsSL --proto '=https' --tlsv1.2 -m 30 "$SIG_URL" -o "$tmp/SHA256SUMS.sig" || die "signature download failed"
     printf '%s\n' "$UPDATE_PUBKEY_PEM" > "$tmp/pub.pem"
-    if ! openssl pkeyutl -verify -pubin -inkey "$tmp/pub.pem" -rawin \
+    if ! "$OPENSSL" pkeyutl -verify -pubin -inkey "$tmp/pub.pem" -rawin \
                  -in "$tmp/SHA256SUMS" -sigfile "$tmp/SHA256SUMS.sig" >/dev/null 2>&1; then
         die "SIGNATURE VERIFICATION FAILED for release $TAG. Refusing. Report this."
     fi
@@ -532,7 +595,14 @@ else
     fail 2 "Policy must pin both an endpoint host and a model"
 fi
 
-unsup 3 "Launcher release signature (release signing not established yet)"
+# Releases ARE signed now, and `--update` refuses anything that does not verify
+# against the pinned publisher key. This still reports UNSUPPORTED, and that is
+# not an oversight: a running program checking its own signature proves nothing,
+# because code that has already been altered can print whatever it likes. The
+# signature is meaningful at the moment of *installation*, which is a different
+# event from this one. Claiming otherwise here would be the exact species of
+# false assurance the rest of this listing exists to avoid.
+unsup 3 "Launcher self-integrity — releases are signed (Ed25519) and --update enforces it, but a running program cannot attest to its own file"
 if git -C "$CLIENT_DIR" rev-parse --short HEAD >/dev/null 2>&1; then
     info 4 "Launcher source revision: $(git -C "$CLIENT_DIR" rev-parse --short HEAD)"
 else
@@ -629,8 +699,8 @@ if [[ "$SCHEME" == "https" && -n "$PORT" && -n "$HOST" ]]; then
     # printed "chain verified; hostname matches" on the mere presence of a
     # BEGIN CERTIFICATE line, which any self-signed certificate satisfies.
     # [audit A26]
-    if ! openssl s_client -help 2>&1 | grep -q -- '-verify_hostname'; then
-        fail 8  "This openssl cannot verify hostnames (-verify_hostname unsupported) — refusing to claim it did"
+    if [[ "$OPENSSL_HAS_VHOST" -ne 1 ]]; then
+        fail 8  "No openssl here can verify hostnames: ${OPENSSL:-none found} lacks -verify_hostname. Fix: brew install openssl@3"
         fail 9  "TLS version/cipher not established"
         fail 10 "TLS SPKI not obtained"
         fail 11 "Certificate identity not established"
@@ -640,7 +710,7 @@ if [[ "$SCHEME" == "https" && -n "$PORT" && -n "$HOST" ]]; then
     # It is stated explicitly rather than piped in, because a backgrounded
     # command (the run_bounded fallback path) gets /dev/null for stdin anyway —
     # this way all three implementations behave identically.
-    tls_out="$(run_bounded 20 openssl s_client -connect "$HOST:$PORT" -servername "$HOST" \
+    tls_out="$(run_bounded 20 "$OPENSSL" s_client -connect "$HOST:$PORT" -servername "$HOST" \
                  -verify_hostname "$HOST" -verify_return_error -verify 6 </dev/null 2>&1)"
     tls_rc=$?
     LEAF_PEM="$(sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' <<<"$tls_out" \
@@ -668,9 +738,9 @@ if [[ "$SCHEME" == "https" && -n "$PORT" && -n "$HOST" ]]; then
             fail 9 "TLS version below the policy floor $MIN_TLS (got ${tlsver:-unknown})"
         fi
 
-        spki="$(printf '%s\n' "$LEAF_PEM" | openssl x509 -noout -pubkey 2>/dev/null \
-                | openssl pkey -pubin -outform der 2>/dev/null \
-                | openssl dgst -sha256 -hex 2>/dev/null | awk '{print $NF}')"
+        spki="$(printf '%s\n' "$LEAF_PEM" | "$OPENSSL" x509 -noout -pubkey 2>/dev/null \
+                | "$OPENSSL" pkey -pubin -outform der 2>/dev/null \
+                | "$OPENSSL" dgst -sha256 -hex 2>/dev/null | awk '{print $NF}')"
         if [[ -z "$PIN_SPKI" || "$PIN_SPKI" == "REPLACE-ME" ]]; then
             # Unpinned used to be INFORMATIONAL. It is a FAILED: the product's
             # pitch is verification, and an unpinned key means the only thing
@@ -703,7 +773,7 @@ if [[ "$SCHEME" == "https" && -n "$PORT" && -n "$HOST" ]]; then
             fail 11 "Policy pins no expected certificate issuer (expected_issuer_org) — refusing to skip the check"
         else
             _idres="$(printf '%s\n' "$LEAF_PEM" \
-                | openssl x509 -noout -issuer -subject -ext subjectAltName -nameopt RFC2253 2>/dev/null \
+                | "$OPENSSL" x509 -noout -issuer -subject -ext subjectAltName -nameopt RFC2253 2>/dev/null \
                 | ISSUER_ORG="$ISSUER_ORG" ISSUER_CN_RE="$ISSUER_CN_RE" python3 -c "$PY_CERT_ID" "$HOST")"
             if [[ "$_idres" == OK* ]]; then
                 ver 11 "Certificate is ours: ${_idres#OK }"
@@ -712,7 +782,7 @@ if [[ "$SCHEME" == "https" && -n "$PORT" && -n "$HOST" ]]; then
             fi
         fi
 
-        if printf '%s\n' "$LEAF_PEM" | openssl x509 -noout -checkend 0 >/dev/null 2>&1; then
+        if printf '%s\n' "$LEAF_PEM" | "$OPENSSL" x509 -noout -checkend 0 >/dev/null 2>&1; then
             ver 12 "Certificate within its validity window"
         else
             fail 12 "Certificate expired or not yet valid"
@@ -755,8 +825,8 @@ if [[ "${1:-}" == "--print-spki" ]]; then
     echo
     if [[ -n "$LEAF_PEM" ]]; then
         echo "tls_spki_sha256 for $HOST:$PORT"
-        printf '%s\n' "$LEAF_PEM" | openssl x509 -noout -pubkey \
-            | openssl pkey -pubin -outform der | openssl dgst -sha256 -hex | awk '{print "  " $NF}'
+        printf '%s\n' "$LEAF_PEM" | "$OPENSSL" x509 -noout -pubkey \
+            | "$OPENSSL" pkey -pubin -outform der | "$OPENSSL" dgst -sha256 -hex | awk '{print "  " $NF}'
         echo
         echo "Compare this against the value the operator publishes BEFORE you put it"
         echo "in your policy. Pinning whatever you happen to see is trust-on-first-use,"
