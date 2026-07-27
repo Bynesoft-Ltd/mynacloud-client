@@ -27,7 +27,7 @@
 # =============================================================================
 set -uo pipefail
 
-VERSION="0.2.4-alpha"
+VERSION="0.2.5-alpha"
 UPDATE_REPO="Bynesoft-Ltd/mynacloud-client"
 
 # Ed25519 public key used by `--update` to verify the release SHA256SUMS.
@@ -115,6 +115,61 @@ info()  { c "$1" INFORMATIONAL "$2"; n_info=$((n_info+1)); }
 die() { echo "  FATAL: $(san "$1")" >&2; exit "${2:-2}"; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not on PATH"; }
+
+# ---- bounded execution -----------------------------------------------------
+# Run a command with a wall-clock bound, on any macOS or Linux host.
+#
+# WHY THIS IS NOT JUST `timeout`: GNU coreutils' timeout(1) gates the TLS probe
+# at check [08]. It is NOT part of a stock macOS install, and `gtimeout` exists
+# only for users who installed coreutils themselves. While [08] called `timeout`
+# unconditionally, every stock-Mac run printed
+#     [08] FAILED  TLS handshake, chain or hostname verification failed
+# with no reason appended — because openssl had never run at all. A missing
+# local tool was wearing the costume of a hostile endpoint.
+#
+# That is the worst available failure mode for this program. Its entire value is
+# telling you apart from an attacker, and it was reporting "your endpoint's
+# certificate cannot be trusted" when the truth was "coreutils is not
+# installed". It also proves the mirror-image bug is possible: a check that
+# cannot run must never be reportable as a check that passed. So the bound is
+# implemented here rather than delegated to a tool that may not exist.
+#
+# Bash 3.2 only — that is still what /bin/bash is on macOS. No `wait -n`, no
+# nameref, no ${var,,}.
+run_bounded() {
+    local _secs="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then
+        command timeout "$_secs" "$@"; return $?
+    fi
+    if command -v gtimeout >/dev/null 2>&1; then
+        command gtimeout "$_secs" "$@"; return $?
+    fi
+
+    # No coreutils. Run the command in the background and let a watchdog kill
+    # it. The watchdog's stdout MUST be redirected: a command substitution
+    # around this function does not return until every process holding the
+    # write end of its pipe has closed it, so a watchdog that inherited stdout
+    # would stall the caller for the FULL timeout even when the command
+    # finished immediately. That bug is invisible on a fast link and looks like
+    # a hang on a slow one, so it is closed here by construction.
+    "$@" &
+    local _pid=$!
+    ( sleep "$_secs"; kill -TERM "$_pid" 2>/dev/null ) >/dev/null 2>&1 &
+    local _watchdog=$!
+
+    local _rc=0
+    wait "$_pid" 2>/dev/null || _rc=$?
+
+    # Stand the watchdog down. Its orphaned `sleep` exits on its own and holds
+    # no descriptor the caller is waiting on.
+    kill -TERM "$_watchdog" 2>/dev/null || true
+    wait "$_watchdog" 2>/dev/null || true
+
+    # 128+SIGTERM means the watchdog fired. Report 124 so a caller cannot tell
+    # this implementation apart from coreutils.
+    [ "$_rc" -eq 143 ] && _rc=124
+    return "$_rc"
+}
 
 # ---- helper programs -------------------------------------------------------
 # Held in variables and handed to `python3 -c` because these ones read their
@@ -581,15 +636,31 @@ if [[ "$SCHEME" == "https" && -n "$PORT" && -n "$HOST" ]]; then
         fail 11 "Certificate identity not established"
         fail 12 "Certificate validity not established"
     else
-    tls_out="$(echo | timeout 20 openssl s_client -connect "$HOST:$PORT" -servername "$HOST" \
-                 -verify_hostname "$HOST" -verify_return_error -verify 6 2>&1)"
+    # stdin is /dev/null so s_client sees EOF and closes after the handshake.
+    # It is stated explicitly rather than piped in, because a backgrounded
+    # command (the run_bounded fallback path) gets /dev/null for stdin anyway —
+    # this way all three implementations behave identically.
+    tls_out="$(run_bounded 20 openssl s_client -connect "$HOST:$PORT" -servername "$HOST" \
+                 -verify_hostname "$HOST" -verify_return_error -verify 6 </dev/null 2>&1)"
+    tls_rc=$?
     LEAF_PEM="$(sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' <<<"$tls_out" \
                 | sed '/-----END CERTIFICATE-----/q')"
     if [[ -n "$LEAF_PEM" ]] && grep -q 'Verify return code: 0 (ok)' <<<"$tls_out"; then
         ver 8 "TLS handshake OK; chain verified to a system root; hostname matches $HOST"
 
         tlsver="$(grep -m1 -oE 'TLSv1\.[0-9]' <<<"$tls_out" | head -1)"
+        # The `Cipher   :` line lives in the SSL-Session block, which OpenSSL 3.x
+        # does NOT print for a TLS 1.3 session that closes before the server's
+        # session ticket arrives — which is every run here, since stdin is EOF.
+        # Without the fallback this reports `cipher ` with an empty value, i.e.
+        # a blank field in a security attestation. Fall back to the summary line
+        # ("New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384"), and say so plainly
+        # if neither is present rather than printing nothing.
         cipher="$(grep -m1 'Cipher *:' <<<"$tls_out" | awk '{print $NF}')"
+        if [[ -z "$cipher" || "$cipher" == ":" ]]; then
+            cipher="$(grep -m1 -E '^New, TLSv[0-9.]+, Cipher is ' <<<"$tls_out" | sed 's/.*Cipher is //')"
+        fi
+        [[ -z "$cipher" ]] && cipher="(not reported by openssl)"
         _rank() { case "$1" in TLSv1.3) echo 4;; TLSv1.2) echo 3;; TLSv1.1) echo 2;; TLSv1.0) echo 1;; *) echo 0;; esac; }
         if (( $(_rank "$tlsver") >= $(_rank "$MIN_TLS") )) && (( $(_rank "$tlsver") > 0 )); then
             ver 9 "TLS $tlsver, cipher $cipher (policy floor $MIN_TLS)"
@@ -647,8 +718,18 @@ if [[ "$SCHEME" == "https" && -n "$PORT" && -n "$HOST" ]]; then
             fail 12 "Certificate expired or not yet valid"
         fi
     else
+        # Say which of the three it was. "Verification failed" is a claim about
+        # the ENDPOINT; a timeout or a local openssl that never ran are claims
+        # about THIS MACHINE, and conflating them is what made the macOS bug so
+        # hard to read from the output alone.
         _why="$(grep -m1 -E 'Verification error|verify error|Verify return code' <<<"$tls_out" | head -1)"
-        fail 8  "TLS handshake, chain or hostname verification failed${_why:+ — $_why}"
+        if [[ "$tls_rc" -eq 124 ]]; then
+            fail 8  "TLS probe timed out after 20s against $HOST:$PORT — endpoint unreachable or not answering"
+        elif [[ -z "$_why" && -z "$LEAF_PEM" ]]; then
+            fail 8  "TLS probe produced no certificate and no verification result (local openssl failure, exit $tls_rc) — this is a problem with THIS machine, not the endpoint: $(printf '%s' "$tls_out" | head -1)"
+        else
+            fail 8  "TLS handshake, chain or hostname verification failed${_why:+ — $_why}"
+        fi
         fail 9  "TLS version/cipher not established"
         fail 10 "TLS SPKI not obtained"
         fail 11 "Certificate identity not established"
