@@ -144,15 +144,19 @@ cat <<EOF
 
 Next steps
 ──────────
-1. Pin the endpoint's TLS key in $CFG_DIR/policy.json.
-   The shipped policy has "tls_spki_sha256": "REPLACE-ME", which makes
-   check [10] FAIL and the launcher refuse to start. That is deliberate.
-   Take the value from the operator's published release notes. You can see
-   what the endpoint is currently presenting with:
+1. The endpoint's TLS key is ALREADY PINNED in $CFG_DIR/policy.json.
+   You do not have to find a value anywhere. It shipped inside this
+   release, whose SHA-256 was verified above before anything was
+   unpacked — a different root of trust from the certificate the
+   endpoint presents, which is what makes check [10] meaningful.
+
+   You are encouraged to check it yourself once the endpoint is up:
 
        tee-claude --print-spki
 
-   and compare it with the published value before you paste it in.
+   It should equal the value in your policy. If it ever does NOT, do not
+   edit your policy to match — that turns a caught problem into an
+   uncaught one. Ask us which it is.
 
 2. Dry-run the verifier without starting a session, and read every line:
 

@@ -27,7 +27,7 @@
 # =============================================================================
 set -uo pipefail
 
-VERSION="0.2.2-alpha"
+VERSION="0.2.3-alpha"
 UPDATE_REPO="Bynesoft-Ltd/mynacloud-client"
 
 # Ed25519 public key used by `--update` to verify the release SHA256SUMS.
@@ -886,7 +886,9 @@ connection check above failed, the most likely
 explanation is simply that the machine is off. Do not
 plan work around this endpoint being reachable.
 
-IMAGES AND PDFs — known limitation, partially unfixable.
+IMAGES AND PDFs — text-only model. Nearly every path fails LOUDLY (clean 400).
+  The one exception is an image FILE read from disk, which would come back as an
+  invented description; the hook installed below is what blocks that path.
 This deployment has no vision, and PDFs are dropped in
 transit. If the model receives one it will answer about
 it CONFIDENTLY AND WRONGLY rather than error. This
